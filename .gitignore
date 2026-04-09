@@ -1,0 +1,8 @@
+responses/
+responses_combined.csv
+*.rds
+.Rdata
+.RData
+.Rhistory
+.Rproj.user/
+rsconnect/
