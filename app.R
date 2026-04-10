@@ -9,11 +9,11 @@ library(sortable)
 RESPONSES_DIR <- "responses"
 if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
 
-# ── Power Automate 持久存储（推荐，M365 用户无需额外权限）─────────────────────
-# 在 Shinyapps.io 应用设置 → Environment Variables 中添加一个变量：
-#   PA_WEBHOOK_URL : Power Automate HTTP 触发器的 POST URL
-# 数据将自动写入你在 SharePoint 上指定的 Excel 表格。
-.pa_url <- Sys.getenv("PA_WEBHOOK_URL")
+# ── Teams Incoming Webhook 持久存储（免费，所有 M365 用户可用）────────────────
+# 在 Shinyapps.io 应用设置 → Environment Variables 中添加：
+#   TEAMS_WEBHOOK_URL : Teams 频道 Incoming Webhook 的 POST URL
+# 每次提交会在指定 Teams 频道推送一条格式化的回答卡片。
+.teams_url <- Sys.getenv("TEAMS_WEBHOOK_URL")
 
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
@@ -380,24 +380,39 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  # 优先 POST 到 Power Automate（数据落入 SharePoint Excel）
-  if (nchar(.pa_url) > 10) {
+  # 优先 POST 到 Teams Incoming Webhook（免费，数据以卡片形式推送到频道）
+  if (nchar(.teams_url) > 10) {
     tryCatch({
       library(httr)
       library(jsonlite)
-      row_list <- as.list(df[1, , drop = FALSE])
-      row_list <- lapply(row_list, function(x) if (is.na(x)) "" else as.character(x))
-      res <- POST(.pa_url,
+      row  <- df[1, , drop = FALSE]
+      # 将每列拼成可读的 facts 列表（跳过空值）
+      facts <- Filter(Negate(is.null), lapply(names(row), function(col) {
+        v <- as.character(row[[col]])
+        if (is.na(v) || nchar(trimws(v)) == 0) return(NULL)
+        list(name = col, value = v)
+      }))
+      card <- list(
+        `@type`      = "MessageCard",
+        `@context`   = "https://schema.org/extensions",
+        themeColor   = "3B82F6",
+        summary      = "AQS 问卷新提交",
+        sections     = list(list(
+          activityTitle = paste0("\U0001f4ca AQS \u95ee\u5377\u65b0\u63d0\u4ea4 \u00b7 ", row$timestamp),
+          facts         = facts
+        ))
+      )
+      res <- POST(.teams_url,
                   add_headers("Content-Type" = "application/json"),
-                  body = toJSON(row_list, auto_unbox = TRUE),
+                  body = toJSON(card, auto_unbox = TRUE),
                   encode = "raw")
-      if (status_code(res) %in% c(200L, 202L)) {
-        message("✓ 已写入 SharePoint Excel（via Power Automate）")
+      if (status_code(res) == 200L) {
+        message("\u2713 \u5df2\u53d1\u9001\u5230 Teams \u9891\u9053")
         return(invisible(NULL))
       } else {
-        message("⚠ Power Automate 返回状态码：", status_code(res))
+        message("\u26a0 Teams webhook \u8fd4\u56de\u72b6\u6001\u7801\uff1a", status_code(res))
       }
-    }, error = function(e) message("⚠ Power Automate POST 失败，回退本地：", e$message))
+    }, error = function(e) message("\u26a0 Teams webhook \u5931\u8d25\uff0c\u56de\u9000\u672c\u5730\uff1a", e$message))
   }
   # 回退：保存本地 RDS（Shinyapps.io 上重启后会丢失，本地运行时有效）
   if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
