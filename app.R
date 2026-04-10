@@ -6,28 +6,59 @@ library(bslib)
 library(shinyjs)
 library(sortable)
 
-RESPONSES_DIR <- "responses"
-if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
+# ── 存储：Azure Blob Storage（Microsoft 基础设施，跨实例永久持久）────────────
+# Shinyapps.io 没有可靠的本地磁盘持久化；Azure Blob 是 Microsoft 自有服务，
+# 数据完全在 Microsoft 体系内，符合数据合规要求。
+#
+# 在 Shinyapps.io → Settings → Environment Variables 中配置：
+#   AZURE_BLOB_URL  : https://账户名.blob.core.windows.net/容器名
+#   AZURE_SAS_TOKEN : SAS 令牌字符串（不含开头的 ?）
+#   ADMIN_KEY       : 管理员页面密码（默认 aqs2026admin）
+#
+.az_url   <- Sys.getenv("AZURE_BLOB_URL")
+.az_sas   <- Sys.getenv("AZURE_SAS_TOKEN")
+.az_ready <- nchar(.az_url) > 10 && nchar(.az_sas) > 10
 
-# ── 全局内存缓存（跨 session 存活，同一 R 进程内持久）─────────────────────────
-# Shinyapps.io 同一实例内 R 进程不重启，缓存在休眠唤醒后依然存在。
-# 配合磁盘 RDS 双写：进程重启时从磁盘重新加载，确保数据不丢。
-.cache <- new.env(parent = emptyenv())
-.cache$rows <- list()
+# Azure Blob REST API 辅助函数 ─────────────────────────────────────
+az_upload <- function(df) {
+  # 每条回答存为一个独立的 JSON blob，文件名含时间戳确保唯一
+  blob_name <- paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S_"),
+                      as.integer(Sys.time() * 1000) %% 1000, ".json")
+  url <- paste0(.az_url, "/", blob_name, "?", .az_sas)
+  row <- as.list(df[1, , drop = FALSE])
+  row <- lapply(row, function(x) if (is.na(x)) "" else as.character(x))
+  httr::PUT(url,
+            httr::add_headers("x-ms-blob-type" = "BlockBlob",
+                              "Content-Type"   = "application/json; charset=utf-8"),
+            body   = jsonlite::toJSON(row, auto_unbox = TRUE),
+            encode = "raw")
+}
 
-# 启动时从磁盘加载历史回答到内存
-local({
-  files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
-  for (f in files) {
-    tryCatch({ .cache$rows <- c(.cache$rows, list(readRDS(f))) },
-             error = function(e) NULL)
-  }
-  if (length(.cache$rows) > 0)
-    message(sprintf("✓ 启动时从磁盘加载 %d 份历史回答", length(.cache$rows)))
-})
+az_list_names <- function() {
+  url  <- paste0(.az_url, "?restype=container&comp=list&", .az_sas)
+  resp <- httr::GET(url)
+  txt  <- httr::content(resp, "text", encoding = "UTF-8")
+  m    <- gregexpr("(?<=<Name>)[^<]+(?=</Name>)", txt, perl = TRUE)
+  regmatches(txt, m)[[1]]
+}
 
-# 管理员密码（在 Shinyapps.io Environment Variables 设置 ADMIN_KEY；
-# 未设置时默认 aqs2026admin）
+az_download_all <- function() {
+  names <- az_list_names()
+  if (length(names) == 0) return(NULL)
+  rows <- Filter(Negate(is.null), lapply(names, function(nm) {
+    url <- paste0(.az_url, "/", nm, "?", .az_sas)
+    tryCatch({
+      resp <- httr::GET(url)
+      as.data.frame(jsonlite::fromJSON(
+        httr::content(resp, "text", encoding = "UTF-8")),
+        stringsAsFactors = FALSE)
+    }, error = function(e) NULL)
+  }))
+  if (length(rows) == 0) return(NULL)
+  df <- do.call(rbind, rows)
+  df[order(df$timestamp), ]
+}
+
 ADMIN_KEY <- Sys.getenv("ADMIN_KEY", unset = "aqs2026admin")
 
 LAST_Q_PAGE   <- 13
@@ -395,15 +426,19 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  # ① 写入全局内存缓存（进程内立即可查）
-  .cache$rows <- c(.cache$rows, list(df))
-  # ② 写入磁盘 RDS（进程重启后可从磁盘恢复）
-  if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
-  tryCatch(
-    saveRDS(df, file.path(RESPONSES_DIR,
-                          paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".rds"))),
-    error = function(e) message("⚠ 磁盘写入失败（数据仍在内存中）：", e$message)
-  )
+  if (.az_ready) {
+    tryCatch({
+      library(httr); library(jsonlite)
+      res <- az_upload(df)
+      if (httr::status_code(res) %in% c(200L, 201L))
+        message("✓ 已写入 Azure Blob Storage")
+      else
+        message("⚠ Azure 上传返回状态码：", httr::status_code(res))
+    }, error = function(e) message("⚠ Azure 上传失败：", e$message))
+  } else {
+    # 未配置 Azure 时提示（本地开发仍可用 RDS 备用）
+    message("⚠ 未配置 AZURE_BLOB_URL/AZURE_SAS_TOKEN，数据仅在进程内存中，重启后丢失")
+  }
 }
 
 # ── LocalStorage JS ────────────────────────────────────────────────────────────
@@ -513,28 +548,34 @@ server <- function(input, output, session) {
     isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
 
-  # 辅助：从磁盘读取所有 RDS 并合并（跨实例、跨进程的真正数据源）
+  # 辅助：从 Azure Blob 读取所有回答（真正的持久数据源）
   load_all_responses <- function() {
-    files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
-    rows  <- Filter(Negate(is.null),
-                    lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL)))
-    # 同时纳入只在内存里的行（磁盘写入失败时的保险）
-    all   <- c(rows, .cache$rows)
-    if (length(all) == 0) return(NULL)
-    df    <- do.call(rbind, all)
-    df[!duplicated(df$timestamp), ]   # 按时间戳去重
+    if (.az_ready) {
+      tryCatch({
+        library(httr); library(jsonlite)
+        az_download_all()
+      }, error = function(e) { message("Azure 读取失败：", e$message); NULL })
+    } else NULL
   }
 
   output$question_ui <- renderUI({
     if (is_admin()) {
-      n <- length(list.files(RESPONSES_DIR, pattern = "\\.rds$"))
+      # 实时从 Azure 获取数量
+      n <- if (.az_ready) {
+        tryCatch({
+          library(httr)
+          length(az_list_names())
+        }, error = function(e) "?")
+      } else "未配置 Azure"
       div(style = "padding: 40px 8px;",
           h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
           div(class = "info-card",
               p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
                 style = "font-size:16px; margin-bottom:16px;"),
-              if (n == 0)
-                p(style = "color:#64748B;", "尚无回答数据。")
+              if (identical(n, 0) || identical(n, "未配置 Azure"))
+                p(style = "color:#64748B;",
+                  if (.az_ready) "尚无回答数据。" else
+                    "⚠️ 请先配置 AZURE_BLOB_URL 和 AZURE_SAS_TOKEN 环境变量。")
               else
                 downloadButton("dl_csv", "\U2B07\UFE0F 下载全部回答 (CSV)",
                                style = "background:#3B82F6;color:#fff;border:none;
