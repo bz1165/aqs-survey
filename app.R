@@ -6,57 +6,81 @@ library(bslib)
 library(shinyjs)
 library(sortable)
 
-# ── 存储：Azure Blob Storage（Microsoft 基础设施，跨实例永久持久）────────────
-# Shinyapps.io 没有可靠的本地磁盘持久化；Azure Blob 是 Microsoft 自有服务，
-# 数据完全在 Microsoft 体系内，符合数据合规要求。
+# ── 存储：Microsoft Graph API → OneDrive CSV（无需 Azure 订阅）──────────────
+# 每次提交将新行追加到 OneDrive 上的一个 CSV 文件中。
+# 该文件可共享链接，任何有权限的人均可在浏览器中查看最新数据。
 #
-# 在 Shinyapps.io → Settings → Environment Variables 中配置：
-#   AZURE_BLOB_URL  : https://账户名.blob.core.windows.net/容器名
-#   AZURE_SAS_TOKEN : SAS 令牌字符串（不含开头的 ?）
-#   ADMIN_KEY       : 管理员页面密码（默认 aqs2026admin）
-#
-.az_url   <- Sys.getenv("AZURE_BLOB_URL")
-.az_sas   <- Sys.getenv("AZURE_SAS_TOKEN")
-.az_ready <- nchar(.az_url) > 10 && nchar(.az_sas) > 10
+# 配置步骤见 get_token.R（一次性运行）。
+# 在 Shinyapps.io → Settings → Environment Variables 中设置：
+#   MS_TENANT_ID     : Azure AD 租户 ID
+#   MS_CLIENT_ID     : 已注册应用的 Client ID
+#   MS_CLIENT_SECRET : 应用的 Client Secret
+#   MS_REFRESH_TOKEN : 由 get_token.R 生成的刷新令牌
+#   MS_FILE_ID       : OneDrive 上 CSV 文件的 item ID（由 get_token.R 输出）
+#   ADMIN_KEY        : 管理员页面密码（默认 aqs2026admin）
 
-# Azure Blob REST API 辅助函数 ─────────────────────────────────────
-az_upload <- function(df) {
-  # 每条回答存为一个独立的 JSON blob，文件名含时间戳确保唯一
-  blob_name <- paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S_"),
-                      as.integer(Sys.time() * 1000) %% 1000, ".json")
-  url <- paste0(.az_url, "/", blob_name, "?", .az_sas)
-  row <- as.list(df[1, , drop = FALSE])
-  row <- lapply(row, function(x) if (is.na(x)) "" else as.character(x))
-  httr::PUT(url,
-            httr::add_headers("x-ms-blob-type" = "BlockBlob",
-                              "Content-Type"   = "application/json; charset=utf-8"),
-            body   = jsonlite::toJSON(row, auto_unbox = TRUE),
-            encode = "raw")
+# 全局存放当前 refresh token（进程内更新，避免每次读环境变量）
+.ms <- new.env(parent = emptyenv())
+.ms$refresh_token <- Sys.getenv("MS_REFRESH_TOKEN")
+.ms_ready <- nchar(.ms$refresh_token) > 10 &&
+             nchar(Sys.getenv("MS_CLIENT_ID")) > 5
+
+# 用 refresh token 换取 access token（并更新内存中的 refresh token）
+ms_token <- function() {
+  resp <- httr::POST(
+    paste0("https://login.microsoftonline.com/",
+           Sys.getenv("MS_TENANT_ID"), "/oauth2/v2.0/token"),
+    body = list(
+      client_id     = Sys.getenv("MS_CLIENT_ID"),
+      client_secret = Sys.getenv("MS_CLIENT_SECRET"),
+      refresh_token = .ms$refresh_token,
+      grant_type    = "refresh_token",
+      scope         = "Files.ReadWrite offline_access"
+    ), encode = "form"
+  )
+  tok <- httr::content(resp)
+  if (!is.null(tok$refresh_token)) .ms$refresh_token <- tok$refresh_token
+  tok$access_token
 }
 
-az_list_names <- function() {
-  url  <- paste0(.az_url, "?restype=container&comp=list&", .az_sas)
-  resp <- httr::GET(url)
-  txt  <- httr::content(resp, "text", encoding = "UTF-8")
-  m    <- gregexpr("(?<=<Name>)[^<]+(?=</Name>)", txt, perl = TRUE)
-  regmatches(txt, m)[[1]]
+# 读取 OneDrive 上的 CSV
+ms_read <- function(token) {
+  resp <- httr::GET(
+    paste0("https://graph.microsoft.com/v1.0/me/drive/items/",
+           Sys.getenv("MS_FILE_ID"), "/content"),
+    httr::add_headers(Authorization = paste("Bearer", token))
+  )
+  if (httr::status_code(resp) != 200) return(NULL)
+  txt <- httr::content(resp, "text", encoding = "UTF-8")
+  txt <- sub("^\xEF\xBB\xBF", "", txt)           # 去掉 BOM
+  tryCatch(read.csv(text = txt, stringsAsFactors = FALSE, check.names = FALSE),
+           error = function(e) NULL)
 }
 
-az_download_all <- function() {
-  names <- az_list_names()
-  if (length(names) == 0) return(NULL)
-  rows <- Filter(Negate(is.null), lapply(names, function(nm) {
-    url <- paste0(.az_url, "/", nm, "?", .az_sas)
-    tryCatch({
-      resp <- httr::GET(url)
-      as.data.frame(jsonlite::fromJSON(
-        httr::content(resp, "text", encoding = "UTF-8")),
-        stringsAsFactors = FALSE)
-    }, error = function(e) NULL)
-  }))
-  if (length(rows) == 0) return(NULL)
-  df <- do.call(rbind, rows)
-  df[order(df$timestamp), ]
+# 将 data.frame 写回 OneDrive（带 UTF-8 BOM，Excel 直接打开中文不乱码）
+ms_write <- function(df, token) {
+  tmp <- tempfile(fileext = ".csv")
+  con <- file(tmp, "wb")
+  writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)
+  write.csv(df, con, row.names = FALSE)
+  close(con)
+  httr::PUT(
+    paste0("https://graph.microsoft.com/v1.0/me/drive/items/",
+           Sys.getenv("MS_FILE_ID"), "/content"),
+    httr::add_headers(Authorization  = paste("Bearer", token),
+                      "Content-Type" = "text/csv; charset=utf-8"),
+    body   = readBin(tmp, "raw", file.info(tmp)$size),
+    encode = "raw"
+  )
+  file.remove(tmp)
+}
+
+# 追加一行到 OneDrive CSV
+ms_append <- function(new_row) {
+  token    <- ms_token()
+  existing <- ms_read(token)
+  combined <- if (is.null(existing)) new_row else rbind(existing, new_row)
+  ms_write(combined, token)
 }
 
 ADMIN_KEY <- Sys.getenv("ADMIN_KEY", unset = "aqs2026admin")
@@ -426,18 +450,14 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  if (.az_ready) {
+  if (.ms_ready) {
     tryCatch({
-      library(httr); library(jsonlite)
-      res <- az_upload(df)
-      if (httr::status_code(res) %in% c(200L, 201L))
-        message("✓ 已写入 Azure Blob Storage")
-      else
-        message("⚠ Azure 上传返回状态码：", httr::status_code(res))
-    }, error = function(e) message("⚠ Azure 上传失败：", e$message))
+      library(httr)
+      ms_append(df)
+      message("✓ 已写入 OneDrive CSV")
+    }, error = function(e) message("⚠ OneDrive 写入失败：", e$message))
   } else {
-    # 未配置 Azure 时提示（本地开发仍可用 RDS 备用）
-    message("⚠ 未配置 AZURE_BLOB_URL/AZURE_SAS_TOKEN，数据仅在进程内存中，重启后丢失")
+    message("⚠ 未配置 MS_* 环境变量，数据未持久保存。请运行 get_token.R 完成配置。")
   }
 }
 
@@ -548,34 +568,29 @@ server <- function(input, output, session) {
     isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
 
-  # 辅助：从 Azure Blob 读取所有回答（真正的持久数据源）
+  # 从 OneDrive 读取当前全量数据
   load_all_responses <- function() {
-    if (.az_ready) {
-      tryCatch({
-        library(httr); library(jsonlite)
-        az_download_all()
-      }, error = function(e) { message("Azure 读取失败：", e$message); NULL })
-    } else NULL
+    if (!.ms_ready) return(NULL)
+    tryCatch({
+      library(httr)
+      ms_read(ms_token())
+    }, error = function(e) { message("OneDrive 读取失败：", e$message); NULL })
   }
 
   output$question_ui <- renderUI({
     if (is_admin()) {
-      # 实时从 Azure 获取数量
-      n <- if (.az_ready) {
-        tryCatch({
-          library(httr)
-          length(az_list_names())
-        }, error = function(e) "?")
-      } else "未配置 Azure"
+      df_now <- load_all_responses()
+      n      <- if (is.null(df_now)) 0 else nrow(df_now)
       div(style = "padding: 40px 8px;",
           h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
           div(class = "info-card",
               p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
                 style = "font-size:16px; margin-bottom:16px;"),
-              if (identical(n, 0) || identical(n, "未配置 Azure"))
-                p(style = "color:#64748B;",
-                  if (.az_ready) "尚无回答数据。" else
-                    "⚠️ 请先配置 AZURE_BLOB_URL 和 AZURE_SAS_TOKEN 环境变量。")
+              if (!.ms_ready)
+                p(style = "color:#EF4444;",
+                  "⚠️ 未配置 MS_* 环境变量，请先运行 get_token.R 并配置环境变量。")
+              else if (n == 0)
+                p(style = "color:#64748B;", "尚无回答数据。")
               else
                 downloadButton("dl_csv", "\U2B07\UFE0F 下载全部回答 (CSV)",
                                style = "background:#3B82F6;color:#fff;border:none;
@@ -596,16 +611,14 @@ server <- function(input, output, session) {
       paste0("aqs_responses_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
     content = function(file) {
       df_all <- load_all_responses()
-      # 写 UTF-8 BOM，让 Excel 在 Windows 上正确识别中文，不再乱码
-      con <- file(file, open = "wb")
-      writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)   # UTF-8 BOM
+      con    <- file(file, open = "wb")
+      writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)   # UTF-8 BOM → Excel 不乱码
       if (is.null(df_all)) {
         writeLines("info\r\n暂无数据", con)
       } else {
-        csv_text <- capture.output(
-          write.csv(df_all, stdout(), row.names = FALSE, fileEncoding = "UTF-8")
-        )
-        writeLines(csv_text, con)
+        writeLines(
+          capture.output(write.csv(df_all, stdout(), row.names = FALSE)),
+          con)
       }
       close(con)
     }
