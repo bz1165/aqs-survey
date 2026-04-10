@@ -83,17 +83,15 @@ Q3_ITEMS <- enc2utf8(c(
   "其他（默认无，如有请注明）"
 ))
 
-Q7_ITEMS <- enc2utf8(c(
-  "输出存在错误或幻觉，需要人工核查（例如：AI 引用的文献不存在或信息不准确）",
-  "AI 检索的文献不是最新的，存在知识截止日期问题",
-  "AI 缺乏统计和制药领域专业知识，输出过于泛化",
-  "内部 AI 工具功能受限，无法满足技术需求",
-  "难以融入现有 workflow",
-  "AI 对 SAS 语言的支持远不如对 R / Python 的支持",
-  "图像识别准确度不够",
-  "AI 输出结果的可复现性和可追溯性较低（例如：重复提问时，会收到不同的答案）",
-  "当前对话次数过多，AI 会出现记忆丢失",
-  "其他（默认无，如有请注明）"
+Q7_CHOICES <- enc2utf8(c(
+  "A. 输出存在错误或幻觉，需要人工核查（例如：AI 引用的文献不存在或信息不准确）"="A",
+  "B. AI 缺乏统计和制药领域专业知识，输出过于泛化"="B",
+  "C. 内部 AI 工具功能受限，无法满足技术需求"="C",
+  "D. 难以融入现有 workflow"="D",
+  "E. AI 对 SAS 语言的支持远不如对 R / Python 的支持"="E",
+  "F. AI 输出结果的可复现性和可追溯性较低（例如：重复提问时，会收到不同的答案）"="F",
+  "G. 当前对话次数过多，AI 会出现记忆丢失"="G",
+  "H. 其他"="H"
 ))
 
 Q9_ITEMS <- enc2utf8(c(
@@ -230,9 +228,14 @@ q6_page <- function(s=list()) {
 }
 
 q7_page <- function(s=list()) {
-  items <- restore_rank(sv(s,"q7",NULL), Q7_ITEMS)
-  qcard("Q7","排序","你在使用 AI 过程中遇到过哪些挑战？请按影响程度排列（影响最大排最前）",
-        rank_ui("q7_ranking", items, "如有其他，请注明内容：", sv(s,"q7_other","")))
+  qcard("Q7","多选（最多 3 项）","你在使用 AI 过程中遇到过哪些挑战？（最多选 3 项）",
+        tagList(
+          check_hc("q7", Q7_CHOICES, checked=sv(s,"q7",character(0))),
+          conditionalPanel("input.q7 !== null && input.q7.includes('H')",
+                           div(class="cond-field",
+                               textInput("q7_other","请注明：",value=sv(s,"q7_other",""),
+                                         placeholder="请输入…"))),
+          uiOutput("q7_warn")))
 }
 
 q8_page <- function(s=list()) {
@@ -326,6 +329,9 @@ validate_page <- function(p, input) {
   else if (p== 7){
     if(is.null(input$q6)||length(input$q6)==0) return(fail(need))
     if(length(input$q6)>3) return(fail("Q6 最多选择 3 项，请重新选择。"))}
+  else if (p== 8){
+    if(is.null(input$q7)||length(input$q7)==0) return(fail(need))
+    if(length(input$q7)>3) return(fail("Q7 最多选择 3 项，请重新选择。"))}
   else if (p== 9){if(is.null(input$q8) ||input$q8 =="")           return(fail(need))}
   else if (p==12){if(is.null(input$q11)||input$q11=="")           return(fail(need))}
   ok()
@@ -341,7 +347,7 @@ save_page <- function(p, input, rv) {
   if (p== 6){rv$q5 <- input$q5;          rv$q5_other_text <- input$q5_other_text
              rv$q5_text <- input$q5_text}
   if (p== 7){rv$q6 <- input$q6;          rv$q6_other      <- input$q6_other}
-  if (p== 8){rv$q7 <- input$q7_ranking;  rv$q7_other      <- input$q7_ranking_other}
+  if (p== 8){rv$q7 <- input$q7;          rv$q7_other      <- input$q7_other}
   if (p== 9){rv$q8 <- input$q8}
   if (p==10){rv$q9 <- input$q9_ranking;  rv$q9_other      <- input$q9_ranking_other}
   if (p==11){rv$q10 <- input$q10;        rv$q10_other     <- input$q10_other}
@@ -362,7 +368,7 @@ write_response <- function(rv, user_id=NA_character_) {
     q4=scalar(rv$q4),
     q5=scalar(rv$q5), q5_other_text=clean(rv$q5_other_text), q5_text=clean(rv$q5_text),
     q6=collapse(rv$q6), q6_other=clean(rv$q6_other),
-    q7_ranking=collapse(rv$q7), q7_other=clean(rv$q7_other),
+    q7=collapse(rv$q7), q7_other=clean(rv$q7_other),
     q8=scalar(rv$q8),
     q9_ranking=collapse(rv$q9), q9_other=clean(rv$q9_other),
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
@@ -425,7 +431,10 @@ server <- function(input, output, session) {
   observeEvent(input[["_ls_restore"]], once=TRUE, {
     state  <- input[["_ls_restore"]]
     p_back <- as.integer(state[["current_page"]]%||%0)
-    if (is.na(p_back)||p_back<=1) return()
+    if (is.na(p_back)||p_back<=1||p_back>=THANKYOU_PAGE){
+      runjs(sprintf("try{localStorage.removeItem('%s');}catch(e){}", LS_KEY))
+      return()
+    }
     for (nm in setdiff(names(state),"current_page")) {
       val <- state[[nm]]
       if (!is.null(val)&&length(val)>0)
@@ -481,6 +490,10 @@ server <- function(input, output, session) {
     if(!is.null(input$q6)&&length(input$q6)>3)
       div(class="warn-msg","⚠️ 最多选择 3 项，请重新选择。")
   })
+  output$q7_warn <- renderUI({
+    if(!is.null(input$q7)&&length(input$q7)>3)
+      div(class="warn-msg","⚠️ 最多选择 3 项，请重新选择。")
+  })
   output$nav_ui <- renderUI({
     p<-page(); if(p==THANKYOU_PAGE) return(NULL)
     div(class="nav-row",
@@ -497,17 +510,16 @@ server <- function(input, output, session) {
     v <- validate_page(p,input)
     if(!v$ok){showNotification(v$msg,type="warning",duration=4);return()}
     save_page(p,input,rv)
-    next_p <- if(p==3&&isTRUE(input$q2=="G")){6}
-              else if(p==LAST_Q_PAGE){write_response(rv,user_id);THANKYOU_PAGE}
-              else{p+1}
-    if(next_p<THANKYOU_PAGE){
-      state <- reactiveValuesToList(rv)
-      state <- state[!grepl("^\\.",names(state))]
-      state$current_page <- next_p
-      session$sendCustomMessage("lsSave",state)
-    } else {
-      session$sendCustomMessage("lsClear",list())
+    if(p==LAST_Q_PAGE){
+      runjs(sprintf("try{localStorage.removeItem('%s');}catch(e){}", LS_KEY))
+      write_response(rv,user_id)
+      page(THANKYOU_PAGE); scroll_top(); return()
     }
+    next_p <- if(p==3&&isTRUE(input$q2=="G")) 6 else p+1
+    state <- reactiveValuesToList(rv)
+    state <- state[!grepl("^\\.",names(state))]
+    state$current_page <- next_p
+    session$sendCustomMessage("lsSave",state)
     page(next_p); scroll_top()
   })
 

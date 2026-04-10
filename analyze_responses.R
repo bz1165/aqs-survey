@@ -99,8 +99,14 @@ expand_multi(df, "q6") |> count(value, sort=TRUE) |>
   mutate(任务 = lbl_q6[value], 占比 = paste0(round(n/nrow(df)*100,1),"%")) |> print()
 
 # Q7
-divider("Q7 使用 AI 遇到的挑战排序（平均名次，1=影响最大）")
-mean_rank(df, "q7_ranking") |> print()
+divider("Q7 使用 AI 遇到的挑战（多选，最多3项）")
+lbl_q7 <- c(A="输出错误/幻觉", B="缺乏专业知识", C="工具功能受限",
+             D="难融入workflow", E="SAS支持弱", F="可复现性低",
+             G="记忆丢失", H="其他")
+expand_multi(df, "q7") |> count(value, sort=TRUE) |>
+  mutate(挑战 = lbl_q7[value], 占比 = paste0(round(n/nrow(df)*100,1),"%")) |> print()
+cat("\n  其他补充：\n")
+df |> filter(!is.na(q7_other)) |> pull(q7_other) |> walk(~cat(" •", .x, "\n"))
 
 # Q8
 divider("Q8 使用 AI 是否花更多时间")
