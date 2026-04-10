@@ -513,9 +513,21 @@ server <- function(input, output, session) {
     isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
 
+  # 辅助：从磁盘读取所有 RDS 并合并（跨实例、跨进程的真正数据源）
+  load_all_responses <- function() {
+    files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
+    rows  <- Filter(Negate(is.null),
+                    lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL)))
+    # 同时纳入只在内存里的行（磁盘写入失败时的保险）
+    all   <- c(rows, .cache$rows)
+    if (length(all) == 0) return(NULL)
+    df    <- do.call(rbind, all)
+    df[!duplicated(df$timestamp), ]   # 按时间戳去重
+  }
+
   output$question_ui <- renderUI({
     if (is_admin()) {
-      n <- length(.cache$rows)
+      n <- length(list.files(RESPONSES_DIR, pattern = "\\.rds$"))
       div(style = "padding: 40px 8px;",
           h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
           div(class = "info-card",
@@ -542,18 +554,19 @@ server <- function(input, output, session) {
     filename = function()
       paste0("aqs_responses_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
     content = function(file) {
-      rows <- .cache$rows
-      # 若内存为空，尝试从磁盘重新加载
-      if (length(rows) == 0) {
-        files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
-        rows  <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
-        rows  <- Filter(Negate(is.null), rows)
-      }
-      if (length(rows) == 0) {
-        write.csv(data.frame(info = "暂无数据"), file, row.names = FALSE)
+      df_all <- load_all_responses()
+      # 写 UTF-8 BOM，让 Excel 在 Windows 上正确识别中文，不再乱码
+      con <- file(file, open = "wb")
+      writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)   # UTF-8 BOM
+      if (is.null(df_all)) {
+        writeLines("info\r\n暂无数据", con)
       } else {
-        write.csv(do.call(rbind, rows), file, row.names = FALSE, fileEncoding = "UTF-8")
+        csv_text <- capture.output(
+          write.csv(df_all, stdout(), row.names = FALSE, fileEncoding = "UTF-8")
+        )
+        writeLines(csv_text, con)
       }
+      close(con)
     }
   )
 
