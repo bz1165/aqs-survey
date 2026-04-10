@@ -369,6 +369,34 @@ textarea.form-control { resize: vertical; min-height: 120px; }
   to   { opacity: 1; transform: translateY(0); }
 }
 
+/* ── Modal buttons ───────────────────────────────────────────────── */
+.btn-modal-pri {
+  background: var(--blue);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 10px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s;
+}
+.btn-modal-pri:hover { background: var(--blue-dark); }
+
+.btn-modal-sec {
+  background: #F1F5F9;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 22px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  margin-right: 8px;
+  transition: border-color .15s;
+}
+.btn-modal-sec:hover { border-color: var(--blue); color: var(--blue); }
+
 /* ── Mobile ──────────────────────────────────────────────────────── */
 @media (max-width: 480px) {
   .intro-h1   { font-size: 22px; }
