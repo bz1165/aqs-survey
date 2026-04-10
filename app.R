@@ -9,6 +9,23 @@ library(sortable)
 RESPONSES_DIR <- "responses"
 if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
 
+# ── Google Sheets 持久存储（可选，配置环境变量后启用）──────────────────────────
+# 在 Shinyapps.io 应用设置 → Environment Variables 中添加：
+#   GS_KEY      : 服务账号 JSON 文件的完整内容（字符串）
+#   GS_SHEET_ID : Google Sheet 的 ID（URL 中 /d/ 后面那段）
+.gs_ready <- FALSE
+if (nchar(Sys.getenv("GS_KEY")) > 10 && nchar(Sys.getenv("GS_SHEET_ID")) > 5) {
+  tryCatch({
+    library(googlesheets4)
+    tmp <- tempfile(fileext = ".json")
+    writeLines(Sys.getenv("GS_KEY"), tmp)
+    gs4_auth(path = tmp)
+    file.remove(tmp)
+    .gs_ready <- TRUE
+    message("✓ Google Sheets 认证成功")
+  }, error = function(e) message("⚠ Google Sheets 认证失败：", e$message))
+}
+
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 LS_KEY        <- "aqs_survey_2026_v1"
@@ -374,6 +391,16 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
+  # 优先写入 Google Sheets（持久存储）
+  if (.gs_ready) {
+    tryCatch({
+      googlesheets4::sheet_append(Sys.getenv("GS_SHEET_ID"), df)
+      message("✓ 已写入 Google Sheets")
+      return(invisible(NULL))
+    }, error = function(e) message("⚠ Google Sheets 写入失败，回退本地：", e$message))
+  }
+  # 回退：保存本地 RDS（Shinyapps.io 上重启后会丢失，本地运行时有效）
+  if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
   saveRDS(df, file.path(RESPONSES_DIR,
                         paste0("resp_",format(Sys.time(),"%Y%m%d_%H%M%S"),".rds")))
 }
@@ -513,6 +540,28 @@ server <- function(input, output, session) {
     if(p==LAST_Q_PAGE){
       runjs(sprintf("try{localStorage.removeItem('%s');}catch(e){}", LS_KEY))
       write_response(rv,user_id)
+      # 立即弹出感谢弹窗（不依赖 Shiny 页面重渲染，防止 session 断开前来不及显示）
+      showModal(modalDialog(
+        title = NULL,
+        div(class="ty-wrap", style="padding:24px 8px 8px;",
+            div(class="ty-icon","🎉"),
+            h2(class="ty-h2","感谢你的填写！"),
+            div(class="ty-sub","问卷已成功提交"),
+            div(class="info-card", style="text-align:left;",
+                p("回收的结果将在 4 月底以匿名汇总的形式与全部门同步。"),
+                tags$hr(),
+                tags$strong("📢 关于后续参与机会（与本问卷无关）"),
+                p("如果你对以下任何一件事感兴趣，欢迎直接私信 Mingmei 或 Beichen："),
+                tags$ul(
+                  tags$li("① 成为 AQS Use Case 的贡献者"),
+                  tags$li("② 参加 AQS AI Workshop"),
+                  tags$li("③ 加入 Pilot 项目的技术小组（5 月起）")),
+                p(style="margin-top:12px;",
+                  "📅 从下周开始每周三 11:30 在 Teams 频道发布 AQS AI Weekly Tip。"))),
+        footer = NULL,
+        easyClose = FALSE,
+        size = "m"
+      ))
       page(THANKYOU_PAGE); scroll_top(); return()
     }
     next_p <- if(p==3&&isTRUE(input$q2=="G")) 6 else p+1
