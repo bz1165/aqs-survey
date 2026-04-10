@@ -9,11 +9,26 @@ library(sortable)
 RESPONSES_DIR <- "responses"
 if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
 
-# ── Teams Incoming Webhook 持久存储（免费，所有 M365 用户可用）────────────────
-# 在 Shinyapps.io 应用设置 → Environment Variables 中添加：
-#   TEAMS_WEBHOOK_URL : Teams 频道 Incoming Webhook 的 POST URL
-# 每次提交会在指定 Teams 频道推送一条格式化的回答卡片。
-.teams_url <- Sys.getenv("TEAMS_WEBHOOK_URL")
+# ── 全局内存缓存（跨 session 存活，同一 R 进程内持久）─────────────────────────
+# Shinyapps.io 同一实例内 R 进程不重启，缓存在休眠唤醒后依然存在。
+# 配合磁盘 RDS 双写：进程重启时从磁盘重新加载，确保数据不丢。
+.cache <- new.env(parent = emptyenv())
+.cache$rows <- list()
+
+# 启动时从磁盘加载历史回答到内存
+local({
+  files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
+  for (f in files) {
+    tryCatch({ .cache$rows <- c(.cache$rows, list(readRDS(f))) },
+             error = function(e) NULL)
+  }
+  if (length(.cache$rows) > 0)
+    message(sprintf("✓ 启动时从磁盘加载 %d 份历史回答", length(.cache$rows)))
+})
+
+# 管理员密码（在 Shinyapps.io Environment Variables 设置 ADMIN_KEY；
+# 未设置时默认 aqs2026admin）
+ADMIN_KEY <- Sys.getenv("ADMIN_KEY", unset = "aqs2026admin")
 
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
@@ -380,44 +395,15 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  # 优先 POST 到 Teams Incoming Webhook（免费，数据以卡片形式推送到频道）
-  if (nchar(.teams_url) > 10) {
-    tryCatch({
-      library(httr)
-      library(jsonlite)
-      row  <- df[1, , drop = FALSE]
-      # 将每列拼成可读的 facts 列表（跳过空值）
-      facts <- Filter(Negate(is.null), lapply(names(row), function(col) {
-        v <- as.character(row[[col]])
-        if (is.na(v) || nchar(trimws(v)) == 0) return(NULL)
-        list(name = col, value = v)
-      }))
-      card <- list(
-        `@type`      = "MessageCard",
-        `@context`   = "https://schema.org/extensions",
-        themeColor   = "3B82F6",
-        summary      = "AQS 问卷新提交",
-        sections     = list(list(
-          activityTitle = paste0("\U0001f4ca AQS \u95ee\u5377\u65b0\u63d0\u4ea4 \u00b7 ", row$timestamp),
-          facts         = facts
-        ))
-      )
-      res <- POST(.teams_url,
-                  add_headers("Content-Type" = "application/json"),
-                  body = toJSON(card, auto_unbox = TRUE),
-                  encode = "raw")
-      if (status_code(res) == 200L) {
-        message("\u2713 \u5df2\u53d1\u9001\u5230 Teams \u9891\u9053")
-        return(invisible(NULL))
-      } else {
-        message("\u26a0 Teams webhook \u8fd4\u56de\u72b6\u6001\u7801\uff1a", status_code(res))
-      }
-    }, error = function(e) message("\u26a0 Teams webhook \u5931\u8d25\uff0c\u56de\u9000\u672c\u5730\uff1a", e$message))
-  }
-  # 回退：保存本地 RDS（Shinyapps.io 上重启后会丢失，本地运行时有效）
+  # ① 写入全局内存缓存（进程内立即可查）
+  .cache$rows <- c(.cache$rows, list(df))
+  # ② 写入磁盘 RDS（进程重启后可从磁盘恢复）
   if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
-  saveRDS(df, file.path(RESPONSES_DIR,
-                        paste0("resp_",format(Sys.time(),"%Y%m%d_%H%M%S"),".rds")))
+  tryCatch(
+    saveRDS(df, file.path(RESPONSES_DIR,
+                          paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".rds"))),
+    error = function(e) message("⚠ 磁盘写入失败（数据仍在内存中）：", e$message)
+  )
 }
 
 # ── LocalStorage JS ────────────────────────────────────────────────────────────
@@ -504,10 +490,12 @@ server <- function(input, output, session) {
   })
 
   output$top_bar_right <- renderUI({
+    if(is_admin()) return(NULL)
     p<-page(); if(p%in%c(0,THANKYOU_PAGE)) return(NULL)
     span(class="top-bar-counter",paste0("Q",p-1," / Q12"))
   })
   output$progress_ui <- renderUI({
+    if(is_admin()) return(NULL)
     p<-page(); if(p%in%c(0,THANKYOU_PAGE)) return(NULL)
     pct<-round((p-1)/LAST_Q_PAGE*100)
     div(class="prog-wrap",
@@ -519,14 +507,55 @@ server <- function(input, output, session) {
     div(class="section-badge",lbl)
   })
 
-  output$question_ui <- renderUI({
-    p <- page(); s <- reactiveValuesToList(rv)
-    switch(as.character(p),
-      "0"=intro_page(),"1"=q0_page(s),"2"=q1_page(s),"3"=q2_page(s),
-      "4"=q3_page(s),"5"=q4_page(s),"6"=q5_page(s),"7"=q6_page(s),
-      "8"=q7_page(s),"9"=q8_page(s),"10"=q9_page(s),"11"=q10_page(s),
-      "12"=q11_page(s),"13"=q12_page(s),"14"=thankyou_page())
+  # ── 管理员模式检测（URL 加 ?admin=密码 访问）──
+  is_admin <- reactive({
+    q <- parseQueryString(session$clientData$url_search)
+    isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
+
+  output$question_ui <- renderUI({
+    if (is_admin()) {
+      n <- length(.cache$rows)
+      div(style = "padding: 40px 8px;",
+          h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
+          div(class = "info-card",
+              p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
+                style = "font-size:16px; margin-bottom:16px;"),
+              if (n == 0)
+                p(style = "color:#64748B;", "尚无回答数据。")
+              else
+                downloadButton("dl_csv", "\U2B07\UFE0F 下载全部回答 (CSV)",
+                               style = "background:#3B82F6;color:#fff;border:none;
+                                        padding:10px 24px;border-radius:8px;
+                                        font-size:14px;font-weight:600;cursor:pointer;")))
+    } else {
+      p <- page(); s <- reactiveValuesToList(rv)
+      switch(as.character(p),
+        "0"=intro_page(),"1"=q0_page(s),"2"=q1_page(s),"3"=q2_page(s),
+        "4"=q3_page(s),"5"=q4_page(s),"6"=q5_page(s),"7"=q6_page(s),
+        "8"=q7_page(s),"9"=q8_page(s),"10"=q9_page(s),"11"=q10_page(s),
+        "12"=q11_page(s),"13"=q12_page(s),"14"=thankyou_page())
+    }
+  })
+
+  output$dl_csv <- downloadHandler(
+    filename = function()
+      paste0("aqs_responses_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
+    content = function(file) {
+      rows <- .cache$rows
+      # 若内存为空，尝试从磁盘重新加载
+      if (length(rows) == 0) {
+        files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
+        rows  <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
+        rows  <- Filter(Negate(is.null), rows)
+      }
+      if (length(rows) == 0) {
+        write.csv(data.frame(info = "暂无数据"), file, row.names = FALSE)
+      } else {
+        write.csv(do.call(rbind, rows), file, row.names = FALSE, fileEncoding = "UTF-8")
+      }
+    }
+  )
 
   output$q6_warn <- renderUI({
     if(!is.null(input$q6)&&length(input$q6)>3)
@@ -537,6 +566,7 @@ server <- function(input, output, session) {
       div(class="warn-msg","⚠️ 最多选择 3 项，请重新选择。")
   })
   output$nav_ui <- renderUI({
+    if(is_admin()) return(NULL)
     p<-page(); if(p==THANKYOU_PAGE) return(NULL)
     div(class="nav-row",
         if(p>1) actionButton("btn_back","← 上一题",class="btn-back"),
