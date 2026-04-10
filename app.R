@@ -9,22 +9,11 @@ library(sortable)
 RESPONSES_DIR <- "responses"
 if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
 
-# ── Google Sheets 持久存储（可选，配置环境变量后启用）──────────────────────────
-# 在 Shinyapps.io 应用设置 → Environment Variables 中添加：
-#   GS_KEY      : 服务账号 JSON 文件的完整内容（字符串）
-#   GS_SHEET_ID : Google Sheet 的 ID（URL 中 /d/ 后面那段）
-.gs_ready <- FALSE
-if (nchar(Sys.getenv("GS_KEY")) > 10 && nchar(Sys.getenv("GS_SHEET_ID")) > 5) {
-  tryCatch({
-    library(googlesheets4)
-    tmp <- tempfile(fileext = ".json")
-    writeLines(Sys.getenv("GS_KEY"), tmp)
-    gs4_auth(path = tmp)
-    file.remove(tmp)
-    .gs_ready <- TRUE
-    message("✓ Google Sheets 认证成功")
-  }, error = function(e) message("⚠ Google Sheets 认证失败：", e$message))
-}
+# ── Power Automate 持久存储（推荐，M365 用户无需额外权限）─────────────────────
+# 在 Shinyapps.io 应用设置 → Environment Variables 中添加一个变量：
+#   PA_WEBHOOK_URL : Power Automate HTTP 触发器的 POST URL
+# 数据将自动写入你在 SharePoint 上指定的 Excel 表格。
+.pa_url <- Sys.getenv("PA_WEBHOOK_URL")
 
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
@@ -391,13 +380,24 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  # 优先写入 Google Sheets（持久存储）
-  if (.gs_ready) {
+  # 优先 POST 到 Power Automate（数据落入 SharePoint Excel）
+  if (nchar(.pa_url) > 10) {
     tryCatch({
-      googlesheets4::sheet_append(Sys.getenv("GS_SHEET_ID"), df)
-      message("✓ 已写入 Google Sheets")
-      return(invisible(NULL))
-    }, error = function(e) message("⚠ Google Sheets 写入失败，回退本地：", e$message))
+      library(httr)
+      library(jsonlite)
+      row_list <- as.list(df[1, , drop = FALSE])
+      row_list <- lapply(row_list, function(x) if (is.na(x)) "" else as.character(x))
+      res <- POST(.pa_url,
+                  add_headers("Content-Type" = "application/json"),
+                  body = toJSON(row_list, auto_unbox = TRUE),
+                  encode = "raw")
+      if (status_code(res) %in% c(200L, 202L)) {
+        message("✓ 已写入 SharePoint Excel（via Power Automate）")
+        return(invisible(NULL))
+      } else {
+        message("⚠ Power Automate 返回状态码：", status_code(res))
+      }
+    }, error = function(e) message("⚠ Power Automate POST 失败，回退本地：", e$message))
   }
   # 回退：保存本地 RDS（Shinyapps.io 上重启后会丢失，本地运行时有效）
   if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR)
