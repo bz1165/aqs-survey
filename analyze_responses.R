@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════
 # AQS AI 问卷数据分析脚本
-# 在 aqs-survey/ 目录下运行此脚本
+# 在 RStudio 中运行（需已登录 Posit Connect）
 # ══════════════════════════════════════════════════════
 
 library(dplyr)
@@ -8,14 +8,18 @@ library(tidyr)
 library(readr)
 library(stringr)
 library(purrr)
+library(pins)
 
-RESPONSES_DIR <- "responses"
+PIN_PREFIX <- "aqs_resp_2026_"
 
 # ── 1. 加载所有回收数据 ────────────────────────────────
-load_responses <- function(dir = RESPONSES_DIR) {
-  files <- list.files(dir, pattern = "\\.rds$", full.names = TRUE)
-  if (length(files) == 0) { message("未找到任何回答文件：", dir); return(NULL) }
-  df <- map_dfr(files, readRDS)
+load_responses <- function() {
+  board      <- board_connect()   # 使用 RStudio 已登录的 Connect 账户
+  all_names  <- pin_list(board)
+  resp_names <- grep(paste0("^", PIN_PREFIX), all_names, value = TRUE)
+  if (length(resp_names) == 0) { message("未找到任何回答 pin。"); return(NULL) }
+  rows <- map(resp_names, ~tryCatch(pin_read(board, .x), error = function(e) NULL))
+  df   <- bind_rows(Filter(Negate(is.null), rows))
   message(sprintf("✓ 已加载 %d 份回答。", nrow(df)))
   df
 }

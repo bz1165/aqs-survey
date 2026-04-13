@@ -5,14 +5,20 @@ library(shiny)
 library(bslib)
 library(shinyjs)
 library(sortable)
+library(pins)
 
-# ── 存储：本地 RDS 文件（Posit Connect 部署目录内持久保存）──────────────────
-# Posit Connect 工作目录 = bundle 目录，同一次部署内文件持久存在。
-# 每次提交写一个独立 RDS 文件，避免并发写冲突。
-# 管理员页面读取全部 RDS 并合并下载 CSV。
-RESPONSES_DIR <- "responses"
-if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR, recursive = TRUE)
-message("✓ 存储目录：", normalizePath(RESPONSES_DIR, mustWork = FALSE))
+# ── 存储：pins + board_connect()（跨进程 / 容器持久共享）──────────────────
+# Posit Connect 多进程/容器不共享本地文件系统，使用 pins board 存储。
+# 每条回答写为独立 pin（名称含毫秒时间戳），避免并发写冲突。
+# board_connect() 自动读取 CONNECT_SERVER / CONNECT_API_KEY 环境变量。
+get_board <- function() {
+  board_connect(
+    server = Sys.getenv("CONNECT_SERVER"),
+    key    = Sys.getenv("CONNECT_API_KEY")
+  )
+}
+PIN_PREFIX <- "aqs_resp_2026_"
+message("✓ 存储后端：pins board_connect")
 
 ADMIN_KEY <- Sys.getenv("ADMIN_KEY", unset = "aqs2026admin")
 
@@ -381,13 +387,14 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  # 每条回答写为独立 RDS 文件（文件名含毫秒时间戳，避免并发冲突）
-  fname <- file.path(RESPONSES_DIR,
-                     paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S_"),
-                            as.integer(Sys.time() * 1000) %% 1000, ".rds"))
+  # 每条回答写为独立 pin（名称含毫秒时间戳，避免并发冲突）
+  pin_name <- paste0(PIN_PREFIX,
+                     format(Sys.time(), "%Y%m%d_%H%M%S_"),
+                     as.integer(Sys.time() * 1000) %% 1000)
   tryCatch({
-    saveRDS(df, fname)
-    message("✓ 已保存：", fname)
+    board <- get_board()
+    pin_write(board, df, name = pin_name, type = "rds", versioned = FALSE)
+    message("✓ 已保存 pin：", pin_name)
   }, error = function(e) message("⚠ 保存失败：", e$message))
 }
 
@@ -507,27 +514,35 @@ server <- function(input, output, session) {
     isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
 
-  # 读取全部 RDS 文件并合并
+  # 读取全部 pin 并合并
   load_all_responses <- function() {
-    files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
-    if (length(files) == 0) return(NULL)
-    rows <- Filter(Negate(is.null),
-                   lapply(files, function(f) tryCatch(readRDS(f), error=function(e) NULL)))
-    if (length(rows) == 0) return(NULL)
-    do.call(rbind, rows)
+    tryCatch({
+      board    <- get_board()
+      all_names <- pin_list(board)
+      resp_names <- grep(paste0("^", PIN_PREFIX), all_names, value = TRUE)
+      if (length(resp_names) == 0) return(NULL)
+      rows <- Filter(Negate(is.null),
+                     lapply(resp_names, function(nm)
+                       tryCatch(pin_read(board, nm), error = function(e) NULL)))
+      if (length(rows) == 0) return(NULL)
+      do.call(rbind, rows)
+    }, error = function(e) { message("⚠ 读取失败：", e$message); NULL })
   }
 
   output$question_ui <- renderUI({
     if (is_admin()) {
-      n <- length(list.files(RESPONSES_DIR, pattern = "\\.rds$"))
+      n <- tryCatch({
+        board <- get_board()
+        length(grep(paste0("^", PIN_PREFIX), pin_list(board), value = TRUE))
+      }, error = function(e) NA_integer_)
       div(style = "padding: 40px 8px;",
           h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
           div(class = "info-card",
-              p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
+              p(tags$strong(paste0("当前共收到 ", if(is.na(n)) "（读取失败）" else n, " 份回答")),
                 style = "font-size:16px; margin-bottom:16px;"),
               p(style="font-size:12px;color:#64748B;margin-bottom:16px;",
-                paste0("存储路径：", normalizePath(RESPONSES_DIR, mustWork=FALSE))),
-              if (n == 0)
+                "存储后端：Posit Connect pins board"),
+              if (isTRUE(n == 0))
                 p(style = "color:#64748B;", "尚无回答数据。")
               else
                 downloadButton("dl_csv", "\U2B07\UFE0F 下载全部回答 (CSV)",
