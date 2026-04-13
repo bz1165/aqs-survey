@@ -29,6 +29,28 @@ message("files in getwd(): ", paste(list.files(".", all.files = TRUE), collapse 
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
 
+# 启动时初始化 DB 并迁移旧表（添加 user_id 列）
+tryCatch({
+  con0 <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
+  DBI::dbExecute(con0, "PRAGMA journal_mode=WAL")
+  DBI::dbExecute(con0, "CREATE TABLE IF NOT EXISTS responses (
+    response_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    submitted_at TEXT, user_id TEXT,
+    q0 TEXT, q1 TEXT, q1_other TEXT,
+    q2 TEXT, q2_other TEXT,
+    q3_ranking TEXT, q3_other TEXT,
+    q4 TEXT, q5 TEXT, q5_other_text TEXT, q5_text TEXT,
+    q6 TEXT, q6_other TEXT, q7 TEXT, q7_other TEXT,
+    q8 TEXT, q9_ranking TEXT, q9_other TEXT,
+    q10 TEXT, q10_other TEXT, q11 TEXT, q12 TEXT
+  )")
+  # 迁移：为已存在的旧表添加 user_id 列（若已有则忽略错误）
+  tryCatch(DBI::dbExecute(con0, "ALTER TABLE responses ADD COLUMN user_id TEXT"),
+           error = function(e) NULL)
+  DBI::dbDisconnect(con0)
+  message("✓ DB 初始化成功：", DB_PATH)
+}, error = function(e) message("⚠ DB 初始化失败：", e$message))
+
 sv <- function(saved, key, default = NULL) {
   val <- saved[[key]]
   if (is.null(val) || length(val) == 0) return(default)
@@ -59,6 +81,7 @@ init_db <- function() {
     CREATE TABLE IF NOT EXISTS responses (
       response_id INTEGER PRIMARY KEY AUTOINCREMENT,
       submitted_at TEXT,
+      user_id TEXT,
       q0 TEXT,
       q1 TEXT,
       q1_other TEXT,
@@ -98,7 +121,7 @@ load_all_responses <- function() {
   )
 }
 
-write_response <- function(rv) {
+write_response <- function(rv, user_id = NA_character_) {
   scalar <- function(x) {
     if (is.null(x) || length(x) == 0) return(NA_character_)
     as.character(x[[1]])
@@ -118,6 +141,7 @@ write_response <- function(rv) {
 
   df <- data.frame(
     submitted_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    user_id = as.character(user_id %||% NA_character_),
     q0 = scalar(rv$q0),
     q1 = collapse(rv$q1),
     q1_other = clean(rv$q1_other),
@@ -511,13 +535,16 @@ save_page <- function(p, input, rv) {
   if (p== 1){rv$q0 <- input$q0}
   if (p== 2){rv$q1 <- input$q1;          rv$q1_other      <- input$q1_other}
   if (p== 3){rv$q2 <- input$q2;          rv$q2_other      <- input$q2_other}
-  if (p== 4){rv$q3 <- input$q3_ranking;  rv$q3_other      <- input$q3_ranking_other}
+  # rank_list 未拖拽时 input 为 NULL，回退到默认顺序
+  if (p== 4){rv$q3 <- if(length(input$q3_ranking)>0) input$q3_ranking else Q3_ITEMS
+             rv$q3_other <- input$q3_ranking_other}
   if (p== 5){rv$q4 <- input$q4}
   if (p== 6){rv$q5 <- input$q5;          rv$q5_other_text <- input$q5_other_text; rv$q5_text <- input$q5_text}
   if (p== 7){rv$q6 <- input$q6;          rv$q6_other      <- input$q6_other}
   if (p== 8){rv$q7 <- input$q7;          rv$q7_other      <- input$q7_other}
   if (p== 9){rv$q8 <- input$q8}
-  if (p==10){rv$q9 <- input$q9_ranking;  rv$q9_other      <- input$q9_ranking_other}
+  if (p==10){rv$q9 <- if(length(input$q9_ranking)>0) input$q9_ranking else Q9_ITEMS
+             rv$q9_other <- input$q9_ranking_other}
   if (p==11){rv$q10 <- input$q10;        rv$q10_other     <- input$q10_other}
   if (p==12){rv$q11 <- input$q11}
   if (p==13){rv$q12 <- input$q12}
@@ -730,8 +757,9 @@ server <- function(input, output, session) {
     save_page(p, input, rv)
 
     if (p == LAST_Q_PAGE) {
-      message("SUBMIT_START wd=", getwd(), " db=", DB_PATH)
-      ok <- tryCatch(write_response(rv), error = function(e) {
+      uid <- tryCatch(session$user, error = function(e) NA_character_)
+      message("SUBMIT_START wd=", getwd(), " db=", DB_PATH, " user=", uid)
+      ok <- tryCatch(write_response(rv, user_id = uid), error = function(e) {
         message("SUBMIT_ERROR: ", e$message); FALSE
       })
       message("SUBMIT_RESULT: ", ok)
