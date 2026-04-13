@@ -400,13 +400,17 @@ Shiny.addCustomMessageHandler("lsClear", function(d){
   try{ localStorage.removeItem("%s"); }catch(e){}
 });
 $(document).ready(function(){
+  // 提交按钮点击时立即在客户端写入completed标记，不依赖WebSocket
+  $(document).on("click", "#btn_next.btn-submit", function(){
+    try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
+  });
   setTimeout(function(){
     try{
       var s=localStorage.getItem("%s");
       if(s) Shiny.setInputValue("_ls_restore", JSON.parse(s), {priority:"event"});
     }catch(e){}
   }, 500);
-});', LS_KEY, LS_KEY, LS_KEY)
+});', LS_KEY, LS_KEY, LS_KEY, LS_KEY)
 
 # ── UI ─────────────────────────────────────────────────────────────────────────
 ui <- fluidPage(
@@ -585,8 +589,7 @@ server <- function(input, output, session) {
     save_page(p,input,rv)
     if(p==LAST_Q_PAGE){
       write_response(rv,user_id)
-      # 先写入"已完成"标记到 localStorage，session 断开后 reload 仍能跳到感谢页
-      runjs(sprintf("try{localStorage.setItem('%s',JSON.stringify({completed:true}));}catch(e){}", LS_KEY))
+      # localStorage completed标记已由客户端JS在按钮点击时写入，无需再用runjs
       showModal(modalDialog(
         title = NULL,
         div(class="ty-wrap", style="padding:24px 8px 8px;",
