@@ -1,58 +1,27 @@
-# AQS AI 使用现状摸底问卷 — Posit Connect 测试版（修复 clean + 改数据库路径）
+# AQS AI 使用现状摸底问卷
 try(Sys.setlocale("LC_CTYPE", "en_US.UTF-8"), silent = TRUE)
 
 library(shiny)
 library(bslib)
 library(shinyjs)
 library(sortable)
-library(DBI)
-library(RSQLite)
 
 ADMIN_KEY     <- "aqs2026admin"
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 
-# /var/tmp 在 RHEL 上是 drwxrwxrwt（所有用户可写），跨进程共享，服务器重启后保留
-# path.expand("~") 在 run-as-viewer 模式下每个用户不同，不能用于共享存储
+# ── 存储：每条回答独立 RDS 文件 ────────────────────────────────────────────────
+# /var/tmp 在 RHEL 是 drwxrwxrwt（所有用户可建文件，sticky bit 防止互删）
+# 每人创建自己的文件 → 无共享锁/WAL/SHM → 任何用户均可写入和读取
 DATA_DIR <- "/var/tmp/aqs_survey_2026"
 dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
-Sys.chmod(DATA_DIR, mode = "0777")
-
-DB_PATH <- file.path(DATA_DIR, "responses.sqlite")
+Sys.chmod(DATA_DIR, mode = "0777")   # 确保目录对所有用户可写
 
 message("=== APP START ===")
+message("DATA_DIR: ", DATA_DIR, "  writable=", file.access(DATA_DIR, 2) == 0)
 message("getwd(): ", getwd())
-message("HOME: ", path.expand("~"))
-message("DATA_DIR: ", DATA_DIR)
-message("DATA_DIR exists: ", dir.exists(DATA_DIR))
-message("DATA_DIR writable: ", file.access(DATA_DIR, 2) == 0)
-message("DB_PATH: ", DB_PATH)
-message("tempdir(): ", tempdir())
-message("files in getwd(): ", paste(list.files(".", all.files = TRUE), collapse = ", "))
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
-
-# 启动时初始化 DB 并迁移旧表（添加 user_id 列）
-tryCatch({
-  con0 <- DBI::dbConnect(RSQLite::SQLite(), DB_PATH)
-  DBI::dbExecute(con0, "PRAGMA journal_mode=WAL")
-  DBI::dbExecute(con0, "CREATE TABLE IF NOT EXISTS responses (
-    response_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    submitted_at TEXT, user_id TEXT,
-    q0 TEXT, q1 TEXT, q1_other TEXT,
-    q2 TEXT, q2_other TEXT,
-    q3_ranking TEXT, q3_other TEXT,
-    q4 TEXT, q5 TEXT, q5_other_text TEXT, q5_text TEXT,
-    q6 TEXT, q6_other TEXT, q7 TEXT, q7_other TEXT,
-    q8 TEXT, q9_ranking TEXT, q9_other TEXT,
-    q10 TEXT, q10_other TEXT, q11 TEXT, q12 TEXT
-  )")
-  # 迁移：为已存在的旧表添加 user_id 列（若已有则忽略错误）
-  tryCatch(DBI::dbExecute(con0, "ALTER TABLE responses ADD COLUMN user_id TEXT"),
-           error = function(e) NULL)
-  DBI::dbDisconnect(con0)
-  message("✓ DB 初始化成功：", DB_PATH)
-}, error = function(e) message("⚠ DB 初始化失败：", e$message))
 
 sv <- function(saved, key, default = NULL) {
   val <- saved[[key]]
@@ -75,53 +44,13 @@ clear_rv <- function(rv) {
   for (x in nm) rv[[x]] <- NULL
 }
 
-init_db <- function() {
-  con <- dbConnect(SQLite(), DB_PATH)
-  on.exit(dbDisconnect(con), add = TRUE)
-  dbExecute(con, "PRAGMA journal_mode=WAL")   # 多进程并发安全
-
-  dbExecute(con, "
-    CREATE TABLE IF NOT EXISTS responses (
-      response_id INTEGER PRIMARY KEY AUTOINCREMENT,
-      submitted_at TEXT,
-      user_id TEXT,
-      q0 TEXT,
-      q1 TEXT,
-      q1_other TEXT,
-      q2 TEXT,
-      q2_other TEXT,
-      q3_ranking TEXT,
-      q3_other TEXT,
-      q4 TEXT,
-      q5 TEXT,
-      q5_other_text TEXT,
-      q5_text TEXT,
-      q6 TEXT,
-      q6_other TEXT,
-      q7 TEXT,
-      q7_other TEXT,
-      q8 TEXT,
-      q9_ranking TEXT,
-      q9_other TEXT,
-      q10 TEXT,
-      q10_other TEXT,
-      q11 TEXT,
-      q12 TEXT
-    )
-  ")
-}
-
 load_all_responses <- function() {
-  if (!file.exists(DB_PATH)) return(data.frame())
-  con <- dbConnect(SQLite(), DB_PATH)
-  on.exit(dbDisconnect(con), add = TRUE)
-  tryCatch(
-    dbReadTable(con, "responses"),
-    error = function(e) {
-      message("load_all_responses() failed: ", e$message)
-      data.frame()
-    }
-  )
+  files <- list.files(DATA_DIR, pattern = "^resp_.*\\.rds$", full.names = TRUE)
+  if (length(files) == 0) return(NULL)
+  rows <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
+  rows <- Filter(Negate(is.null), rows)
+  if (length(rows) == 0) return(NULL)
+  do.call(rbind, rows)
 }
 
 write_response <- function(rv, user_id = NA_character_) {
@@ -170,16 +99,17 @@ write_response <- function(rv, user_id = NA_character_) {
     stringsAsFactors = FALSE
   )
 
+  # 文件名含时间戳+毫秒，避免并发冲突；每个用户写自己的文件，无需共享锁
+  fname <- file.path(DATA_DIR,
+                     paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S_"),
+                            as.integer(Sys.time() * 1000) %% 1000, "_",
+                            sample.int(9999, 1), ".rds"))
   tryCatch({
-    init_db()
-    con <- dbConnect(SQLite(), DB_PATH)
-    on.exit(dbDisconnect(con), add = TRUE)
-    dbExecute(con, "PRAGMA journal_mode=WAL")
-    dbWriteTable(con, "responses", df, append = TRUE, row.names = FALSE)
-    message("✓ SQLite write success: ", DB_PATH)
+    saveRDS(df, fname)
+    message("✓ RDS 写入成功：", fname)
     TRUE
   }, error = function(e) {
-    message("✗ SQLite write failed: ", e$message)
+    message("✗ RDS 写入失败：", e$message)
     FALSE
   })
 }
@@ -666,15 +596,13 @@ server <- function(input, output, session) {
   load_all_responses_server <- function() load_all_responses()
 
   output$diag <- renderPrint({
-    df_now <- tryCatch(load_all_responses_server(), error = function(e) data.frame())
+    rds_files <- list.files(DATA_DIR, pattern = "^resp_.*\\.rds$")
     list(
-      DATA_DIR       = DATA_DIR,
-      DATA_DIR_exists  = dir.exists(DATA_DIR),
+      DATA_DIR          = DATA_DIR,
+      DATA_DIR_exists   = dir.exists(DATA_DIR),
       DATA_DIR_writable = file.access(DATA_DIR, 2) == 0,
-      DB_PATH        = DB_PATH,
-      db_exists      = file.exists(DB_PATH),
-      db_size_bytes  = if (file.exists(DB_PATH)) file.info(DB_PATH)$size else NA,
-      response_count = nrow(df_now)
+      rds_file_count    = length(rds_files),
+      rds_files         = rds_files
     )
   })
   output$admin_preview <- renderTable({
@@ -693,7 +621,7 @@ server <- function(input, output, session) {
             p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
               style = "font-size:16px;margin-bottom:16px;"),
             p(style = "font-size:12px;color:#64748B;margin-bottom:16px;",
-              paste0("DB：", DB_PATH)),
+              paste0("存储目录：", DATA_DIR)),
             if (n == 0)
               p(style = "color:#64748B;", "尚无回答数据。")
             else
