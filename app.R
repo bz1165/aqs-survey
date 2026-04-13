@@ -5,21 +5,45 @@ library(shiny)
 library(bslib)
 library(shinyjs)
 library(sortable)
+library(DBI)
+library(RSQLite)
 
 ADMIN_KEY     <- "aqs2026admin"
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 
-# ── 存储：每条回答独立 RDS 文件 ────────────────────────────────────────────────
-# /var/tmp 在 RHEL 是 drwxrwxrwt（所有用户可建文件，sticky bit 防止互删）
-# 每人创建自己的文件 → 无共享锁/WAL/SHM → 任何用户均可写入和读取
+# ── 存储：SQLite 共享文件，固定绝对路径 ────────────────────────────────────────
+# /var/tmp 在 RHEL 是 drwxrwxrwt（所有用户可建文件）
+# journal_mode=DELETE（而非 WAL）：读操作不需要写 .shm 文件，任何用户均可读
+# DB 文件 chmod 666：所有用户可写同一个文件
 DATA_DIR <- "/var/tmp/aqs_survey_2026"
-dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
-Sys.chmod(DATA_DIR, mode = "0777")   # 确保目录对所有用户可写
+DB_PATH  <- file.path(DATA_DIR, "responses.sqlite")
 
-message("=== APP START ===")
-message("DATA_DIR: ", DATA_DIR, "  writable=", file.access(DATA_DIR, 2) == 0)
-message("getwd(): ", getwd())
+dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
+Sys.chmod(DATA_DIR, mode = "0777")
+
+# 初始化表结构（app 启动时运行一次）
+tryCatch({
+  con0 <- dbConnect(SQLite(), DB_PATH)
+  dbExecute(con0, "PRAGMA journal_mode=DELETE")  # 不产生 .shm/.wal，多用户读无障碍
+  dbExecute(con0, "CREATE TABLE IF NOT EXISTS responses (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    submitted_at TEXT, user_id TEXT,
+    q0 TEXT, q1 TEXT, q1_other TEXT,
+    q2 TEXT, q2_other TEXT,
+    q3_ranking TEXT, q3_other TEXT,
+    q4 TEXT, q5 TEXT, q5_other_text TEXT, q5_text TEXT,
+    q6 TEXT, q6_other TEXT, q7 TEXT, q7_other TEXT,
+    q8 TEXT, q9_ranking TEXT, q9_other TEXT,
+    q10 TEXT, q10_other TEXT, q11 TEXT, q12 TEXT
+  )")
+  dbDisconnect(con0)
+  Sys.chmod(DB_PATH, mode = "0666")  # 所有用户可读写此文件
+  message("✓ DB ready: ", DB_PATH)
+}, error = function(e) message("⚠ DB init failed: ", e$message))
+
+message("=== APP START === DATA_DIR writable=", file.access(DATA_DIR, 2) == 0,
+        "  DB exists=", file.exists(DB_PATH))
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
 
@@ -45,12 +69,14 @@ clear_rv <- function(rv) {
 }
 
 load_all_responses <- function() {
-  files <- list.files(DATA_DIR, pattern = "^resp_.*\\.rds$", full.names = TRUE)
-  if (length(files) == 0) return(NULL)
-  rows <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
-  rows <- Filter(Negate(is.null), rows)
-  if (length(rows) == 0) return(NULL)
-  do.call(rbind, rows)
+  if (!file.exists(DB_PATH)) return(NULL)
+  tryCatch({
+    con <- dbConnect(SQLite(), DB_PATH)
+    on.exit(dbDisconnect(con), add = TRUE)
+    dbExecute(con, "PRAGMA journal_mode=DELETE")
+    df <- dbReadTable(con, "responses")
+    if (nrow(df) == 0) NULL else df
+  }, error = function(e) { message("load_all_responses failed: ", e$message); NULL })
 }
 
 write_response <- function(rv, user_id = NA_character_) {
@@ -99,17 +125,15 @@ write_response <- function(rv, user_id = NA_character_) {
     stringsAsFactors = FALSE
   )
 
-  # 文件名含时间戳+毫秒，避免并发冲突；每个用户写自己的文件，无需共享锁
-  fname <- file.path(DATA_DIR,
-                     paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S_"),
-                            as.integer(Sys.time() * 1000) %% 1000, "_",
-                            sample.int(9999, 1), ".rds"))
   tryCatch({
-    saveRDS(df, fname)
-    message("✓ RDS 写入成功：", fname)
+    con <- dbConnect(SQLite(), DB_PATH)
+    on.exit(dbDisconnect(con), add = TRUE)
+    dbExecute(con, "PRAGMA journal_mode=DELETE")
+    dbWriteTable(con, "responses", df, append = TRUE, row.names = FALSE)
+    message("✓ SQLite write success: ", DB_PATH)
     TRUE
   }, error = function(e) {
-    message("✗ RDS 写入失败：", e$message)
+    message("✗ SQLite write failed: ", e$message)
     FALSE
   })
 }
@@ -493,14 +517,16 @@ Shiny.addCustomMessageHandler("lsClear", function(d){
   try{ localStorage.removeItem("%s"); }catch(e){}
 });
 $(document).ready(function(){
-  // 提交按钮点击时立即写入 completed 标记（同步、客户端，不走 WebSocket）
-  // 用三种选择器确保至少一种命中，无论 Shiny 如何渲染按钮
-  $(document).on("click", "#btn_next", function(){
+  // mousedown 比 click 更早触发，在 Shiny WebSocket 消息发出之前写入
+  // 同时监听 click 作为备份
+  function markCompleted() {
     var el = document.getElementById("btn_next");
-    if (el && (el.classList.contains("btn-submit") || el.innerText.indexOf("\u2713") !== -1)) {
+    if (el && (el.classList.contains("btn-submit") || el.textContent.indexOf("\u2713") !== -1)) {
       try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
     }
-  });
+  }
+  $(document).on("mousedown touchstart", "#btn_next", markCompleted);
+  $(document).on("click", "#btn_next", markCompleted);
   setTimeout(function(){
     try{
       var s=localStorage.getItem("%s");
@@ -600,13 +626,15 @@ server <- function(input, output, session) {
   load_all_responses_server <- function() load_all_responses()
 
   output$diag <- renderPrint({
-    rds_files <- list.files(DATA_DIR, pattern = "^resp_.*\\.rds$")
+    df_now <- tryCatch(load_all_responses_server(), error = function(e) NULL)
     list(
       DATA_DIR          = DATA_DIR,
-      DATA_DIR_exists   = dir.exists(DATA_DIR),
       DATA_DIR_writable = file.access(DATA_DIR, 2) == 0,
-      rds_file_count    = length(rds_files),
-      rds_files         = rds_files
+      DB_PATH           = DB_PATH,
+      DB_exists         = file.exists(DB_PATH),
+      DB_size_bytes     = if (file.exists(DB_PATH)) file.info(DB_PATH)$size else NA,
+      response_count    = if (is.null(df_now)) 0L else nrow(df_now),
+      session_user      = tryCatch(session$user, error = function(e) NA)
     )
   })
   output$admin_preview <- renderTable({
@@ -625,7 +653,7 @@ server <- function(input, output, session) {
             p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
               style = "font-size:16px;margin-bottom:16px;"),
             p(style = "font-size:12px;color:#64748B;margin-bottom:16px;",
-              paste0("存储目录：", DATA_DIR)),
+              paste0("DB：", DB_PATH)),
             if (n == 0)
               p(style = "color:#64748B;", "尚无回答数据。")
             else
