@@ -140,7 +140,10 @@ df |> filter(!is.na(q11)) |> count(q11) |>
 # Q12
 divider("Q12 开放回答")
 open <- df |> filter(!is.na(q12) & nchar(q12) > 0) |> pull(q12)
-if (length(open) == 0) cat("  （无开放回答）\n")
-else walk(seq_along(open), ~cat(sprintf("  [%d] %s\n", .x, open[[.x]])))
+if (length(open) == 0) {
+  cat("  （无开放回答）\n")
+} else {
+  walk(seq_along(open), ~cat(sprintf("  [%d] %s\n", .x, open[[.x]])))
+}
 
 cat("\n", strrep("═", 55), "\n分析完成。\n\n")

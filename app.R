@@ -6,82 +6,13 @@ library(bslib)
 library(shinyjs)
 library(sortable)
 
-# ── 存储：Microsoft Graph API → OneDrive CSV（无需 Azure 订阅）──────────────
-# 每次提交将新行追加到 OneDrive 上的一个 CSV 文件中。
-# 该文件可共享链接，任何有权限的人均可在浏览器中查看最新数据。
-#
-# 配置步骤见 get_token.R（一次性运行）。
-# 在 Shinyapps.io → Settings → Environment Variables 中设置：
-#   MS_TENANT_ID     : Azure AD 租户 ID
-#   MS_CLIENT_ID     : 已注册应用的 Client ID
-#   MS_CLIENT_SECRET : 应用的 Client Secret
-#   MS_REFRESH_TOKEN : 由 get_token.R 生成的刷新令牌
-#   MS_FILE_ID       : OneDrive 上 CSV 文件的 item ID（由 get_token.R 输出）
-#   ADMIN_KEY        : 管理员页面密码（默认 aqs2026admin）
-
-# 全局存放当前 refresh token（进程内更新，避免每次读环境变量）
-.ms <- new.env(parent = emptyenv())
-.ms$refresh_token <- Sys.getenv("MS_REFRESH_TOKEN")
-.ms_ready <- nchar(.ms$refresh_token) > 10 &&
-             nchar(Sys.getenv("MS_CLIENT_ID")) > 5
-
-# 用 refresh token 换取 access token（并更新内存中的 refresh token）
-ms_token <- function() {
-  resp <- httr::POST(
-    paste0("https://login.microsoftonline.com/",
-           Sys.getenv("MS_TENANT_ID"), "/oauth2/v2.0/token"),
-    body = list(
-      client_id     = Sys.getenv("MS_CLIENT_ID"),
-      client_secret = Sys.getenv("MS_CLIENT_SECRET"),
-      refresh_token = .ms$refresh_token,
-      grant_type    = "refresh_token",
-      scope         = "Files.ReadWrite offline_access"
-    ), encode = "form"
-  )
-  tok <- httr::content(resp)
-  if (!is.null(tok$refresh_token)) .ms$refresh_token <- tok$refresh_token
-  tok$access_token
-}
-
-# 读取 OneDrive 上的 CSV
-ms_read <- function(token) {
-  resp <- httr::GET(
-    paste0("https://graph.microsoft.com/v1.0/me/drive/items/",
-           Sys.getenv("MS_FILE_ID"), "/content"),
-    httr::add_headers(Authorization = paste("Bearer", token))
-  )
-  if (httr::status_code(resp) != 200) return(NULL)
-  txt <- httr::content(resp, "text", encoding = "UTF-8")
-  txt <- sub("^\xEF\xBB\xBF", "", txt)           # 去掉 BOM
-  tryCatch(read.csv(text = txt, stringsAsFactors = FALSE, check.names = FALSE),
-           error = function(e) NULL)
-}
-
-# 将 data.frame 写回 OneDrive（带 UTF-8 BOM，Excel 直接打开中文不乱码）
-ms_write <- function(df, token) {
-  tmp <- tempfile(fileext = ".csv")
-  con <- file(tmp, "wb")
-  writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)
-  write.csv(df, con, row.names = FALSE)
-  close(con)
-  httr::PUT(
-    paste0("https://graph.microsoft.com/v1.0/me/drive/items/",
-           Sys.getenv("MS_FILE_ID"), "/content"),
-    httr::add_headers(Authorization  = paste("Bearer", token),
-                      "Content-Type" = "text/csv; charset=utf-8"),
-    body   = readBin(tmp, "raw", file.info(tmp)$size),
-    encode = "raw"
-  )
-  file.remove(tmp)
-}
-
-# 追加一行到 OneDrive CSV
-ms_append <- function(new_row) {
-  token    <- ms_token()
-  existing <- ms_read(token)
-  combined <- if (is.null(existing)) new_row else rbind(existing, new_row)
-  ms_write(combined, token)
-}
+# ── 存储：本地 RDS 文件（Posit Connect 部署目录内持久保存）──────────────────
+# Posit Connect 工作目录 = bundle 目录，同一次部署内文件持久存在。
+# 每次提交写一个独立 RDS 文件，避免并发写冲突。
+# 管理员页面读取全部 RDS 并合并下载 CSV。
+RESPONSES_DIR <- "responses"
+if (!dir.exists(RESPONSES_DIR)) dir.create(RESPONSES_DIR, recursive = TRUE)
+message("✓ 存储目录：", normalizePath(RESPONSES_DIR, mustWork = FALSE))
 
 ADMIN_KEY <- Sys.getenv("ADMIN_KEY", unset = "aqs2026admin")
 
@@ -450,15 +381,14 @@ write_response <- function(rv, user_id=NA_character_) {
     q10=collapse(rv$q10), q10_other=clean(rv$q10_other),
     q11=scalar(rv$q11), q12=clean(rv$q12),
     stringsAsFactors=FALSE)
-  if (.ms_ready) {
-    tryCatch({
-      library(httr)
-      ms_append(df)
-      message("✓ 已写入 OneDrive CSV")
-    }, error = function(e) message("⚠ OneDrive 写入失败：", e$message))
-  } else {
-    message("⚠ 未配置 MS_* 环境变量，数据未持久保存。请运行 get_token.R 完成配置。")
-  }
+  # 每条回答写为独立 RDS 文件（文件名含毫秒时间戳，避免并发冲突）
+  fname <- file.path(RESPONSES_DIR,
+                     paste0("resp_", format(Sys.time(), "%Y%m%d_%H%M%S_"),
+                            as.integer(Sys.time() * 1000) %% 1000, ".rds"))
+  tryCatch({
+    saveRDS(df, fname)
+    message("✓ 已保存：", fname)
+  }, error = function(e) message("⚠ 保存失败：", e$message))
 }
 
 # ── LocalStorage JS ────────────────────────────────────────────────────────────
@@ -568,28 +498,27 @@ server <- function(input, output, session) {
     isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
 
-  # 从 OneDrive 读取当前全量数据
+  # 读取全部 RDS 文件并合并
   load_all_responses <- function() {
-    if (!.ms_ready) return(NULL)
-    tryCatch({
-      library(httr)
-      ms_read(ms_token())
-    }, error = function(e) { message("OneDrive 读取失败：", e$message); NULL })
+    files <- list.files(RESPONSES_DIR, pattern = "\\.rds$", full.names = TRUE)
+    if (length(files) == 0) return(NULL)
+    rows <- Filter(Negate(is.null),
+                   lapply(files, function(f) tryCatch(readRDS(f), error=function(e) NULL)))
+    if (length(rows) == 0) return(NULL)
+    do.call(rbind, rows)
   }
 
   output$question_ui <- renderUI({
     if (is_admin()) {
-      df_now <- load_all_responses()
-      n      <- if (is.null(df_now)) 0 else nrow(df_now)
+      n <- length(list.files(RESPONSES_DIR, pattern = "\\.rds$"))
       div(style = "padding: 40px 8px;",
           h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
           div(class = "info-card",
               p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
                 style = "font-size:16px; margin-bottom:16px;"),
-              if (!.ms_ready)
-                p(style = "color:#EF4444;",
-                  "⚠️ 未配置 MS_* 环境变量，请先运行 get_token.R 并配置环境变量。")
-              else if (n == 0)
+              p(style="font-size:12px;color:#64748B;margin-bottom:16px;",
+                paste0("存储路径：", normalizePath(RESPONSES_DIR, mustWork=FALSE))),
+              if (n == 0)
                 p(style = "color:#64748B;", "尚无回答数据。")
               else
                 downloadButton("dl_csv", "\U2B07\UFE0F 下载全部回答 (CSV)",
