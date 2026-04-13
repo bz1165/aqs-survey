@@ -53,6 +53,7 @@ clear_rv <- function(rv) {
 init_db <- function() {
   con <- dbConnect(SQLite(), DB_PATH)
   on.exit(dbDisconnect(con), add = TRUE)
+  dbExecute(con, "PRAGMA journal_mode=WAL")   # 多进程并发安全
 
   dbExecute(con, "
     CREATE TABLE IF NOT EXISTS responses (
@@ -146,6 +147,7 @@ write_response <- function(rv) {
     init_db()
     con <- dbConnect(SQLite(), DB_PATH)
     on.exit(dbDisconnect(con), add = TRUE)
+    dbExecute(con, "PRAGMA journal_mode=WAL")
     dbWriteTable(con, "responses", df, append = TRUE, row.names = FALSE)
     message("✓ SQLite write success: ", DB_PATH)
     TRUE
@@ -521,15 +523,240 @@ save_page <- function(p, input, rv) {
   if (p==13){rv$q12 <- input$q12}
 }
 
+LS_KEY <- "aqs_survey_2026_v2"
+
+LS_JS <- sprintf('
+Shiny.addCustomMessageHandler("lsSave", function(d){
+  try{ localStorage.setItem("%s", JSON.stringify(d)); }catch(e){}
+});
+Shiny.addCustomMessageHandler("lsClear", function(d){
+  try{ localStorage.removeItem("%s"); }catch(e){}
+});
+$(document).ready(function(){
+  // 提交按钮点击时立即写入 completed 标记，session 断开后 reload 仍跳感谢页
+  $(document).on("click", "#btn_next.btn-submit", function(){
+    try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
+  });
+  setTimeout(function(){
+    try{
+      var s=localStorage.getItem("%s");
+      if(s) Shiny.setInputValue("_ls_restore", JSON.parse(s), {priority:"event"});
+    }catch(e){}
+  }, 600);
+});', LS_KEY, LS_KEY, LS_KEY, LS_KEY)
+
 ui <- fluidPage(
-  title="AQS AI 使用现状摸底问卷",
+  title = "AQS AI 使用现状摸底问卷",
   useShinyjs(),
   tags$head(
-    tags$link(rel="stylesheet", href="style.css"),
-    tags$meta(name="viewport", content="width=device-width, initial-scale=1"),
-    tags$meta(charset="UTF-8"))
+    tags$link(rel = "stylesheet", href = "style.css"),
+    tags$meta(name = "viewport", content = "width=device-width, initial-scale=1"),
+    tags$meta(charset = "UTF-8"),
+    tags$script(HTML(LS_JS))
+  ),
+  div(class = "page-shell",
+      div(class = "top-bar",
+          div(class = "top-bar-left",
+              span(class = "aqs-badge", "AQS"),
+              span(class = "top-bar-title", "AI 使用现状摸底问卷 2026")),
+          uiOutput("top_bar_right")),
+      div(class = "survey-body",
+          uiOutput("progress_ui"),
+          uiOutput("section_ui"),
+          div(id = "q-area", uiOutput("question_ui")),
+          uiOutput("nav_ui")))
 )
 
-server <- function(input, output, session) {}
+server <- function(input, output, session) {
+  page <- reactiveVal(0)
+  rv   <- reactiveValues()
+
+  scroll_top <- function() runjs("window.scrollTo({top:0,behavior:'smooth'});")
+  session$allowReconnect(TRUE)
+
+  is_admin <- reactive({
+    q <- parseQueryString(session$clientData$url_search)
+    isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
+  })
+
+  # ── LocalStorage 恢复 ──────────────────────────────
+  observeEvent(input[["_ls_restore"]], once = TRUE, {
+    state <- input[["_ls_restore"]]
+    # 检测已完成标记：直接跳到感谢页并清除
+    if (isTRUE(state[["completed"]])) {
+      session$sendCustomMessage("lsClear", list())
+      page(THANKYOU_PAGE); scroll_top(); return()
+    }
+    p_back <- as.integer(state[["current_page"]] %||% 0)
+    if (is.na(p_back) || p_back <= 1 || p_back >= THANKYOU_PAGE) {
+      session$sendCustomMessage("lsClear", list()); return()
+    }
+    for (nm in setdiff(names(state), "current_page")) {
+      val <- state[[nm]]
+      if (!is.null(val) && length(val) > 0)
+        rv[[nm]] <- if (is.list(val)) unlist(val) else val
+    }
+    rv$.resume_page <- p_back
+    showModal(modalDialog(
+      title = "发现未完成的进度",
+      div(p(paste0("您之前已填写至第 Q", p_back - 1, " 题，是否继续填写？")),
+          p(style = "font-size:13px;color:#64748B;", "选择「继续填写」将恢复您的所有答案。")),
+      footer = tagList(
+        actionButton("btn_restart_modal", "重新开始", class = "btn-modal-sec"),
+        actionButton("btn_resume_modal",  "继续填写",  class = "btn-modal-pri")),
+      easyClose = FALSE))
+  })
+  observeEvent(input$btn_resume_modal, {
+    removeModal(); page(as.integer(rv$.resume_page %||% 1)); scroll_top()
+  })
+  observeEvent(input$btn_restart_modal, {
+    removeModal(); session$sendCustomMessage("lsClear", list()); page(1); scroll_top()
+  })
+
+  output$top_bar_right <- renderUI({
+    if (is_admin()) return(NULL)
+    p <- page(); if (p %in% c(0, THANKYOU_PAGE)) return(NULL)
+    span(class = "top-bar-counter", paste0("Q", p - 1, " / Q12"))
+  })
+  output$progress_ui <- renderUI({
+    if (is_admin()) return(NULL)
+    p <- page(); if (p %in% c(0, THANKYOU_PAGE)) return(NULL)
+    pct <- max(0, min(100, round((p - 1) / (LAST_Q_PAGE - 1) * 100)))
+    div(class = "prog-wrap",
+        div(class = "prog-track", div(class = "prog-fill", style = paste0("width:", pct, "%"))),
+        span(class = "prog-pct", paste0(pct, "%")))
+  })
+  output$section_ui <- renderUI({
+    if (is_admin()) return(NULL)
+    lbl <- section_for_page(page())
+    if (is.null(lbl)) return(NULL)
+    div(class = "section-badge", lbl)
+  })
+
+  load_all_responses_server <- function() load_all_responses()
+
+  output$diag <- renderPrint({
+    df_now <- tryCatch(load_all_responses_server(), error = function(e) data.frame())
+    list(
+      DATA_DIR       = DATA_DIR,
+      DATA_DIR_exists  = dir.exists(DATA_DIR),
+      DATA_DIR_writable = file.access(DATA_DIR, 2) == 0,
+      DB_PATH        = DB_PATH,
+      db_exists      = file.exists(DB_PATH),
+      db_size_bytes  = if (file.exists(DB_PATH)) file.info(DB_PATH)$size else NA,
+      response_count = nrow(df_now)
+    )
+  })
+  output$admin_preview <- renderTable({
+    df <- load_all_responses_server()
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    utils::head(df[rev(seq_len(nrow(df))), , drop = FALSE], 5)
+  }, striped = TRUE, bordered = TRUE, spacing = "s", width = "100%")
+
+  output$question_ui <- renderUI({
+    if (is_admin()) {
+      df_now <- load_all_responses_server()
+      n <- if (is.null(df_now)) 0L else nrow(df_now)
+      return(div(style = "padding:40px 8px;",
+        h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
+        div(class = "info-card",
+            p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
+              style = "font-size:16px;margin-bottom:16px;"),
+            p(style = "font-size:12px;color:#64748B;margin-bottom:16px;",
+              paste0("DB：", DB_PATH)),
+            if (n == 0)
+              p(style = "color:#64748B;", "尚无回答数据。")
+            else
+              tagList(
+                downloadButton("dl_csv", "\u2B07\uFE0F 下载全部回答（CSV）",
+                               style = "background:#3B82F6;color:#fff;border:none;padding:10px 24px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;"),
+                div(style = "margin-top:20px;"),
+                tableOutput("admin_preview")),
+            tags$hr(style = "margin:24px 0;"),
+            tags$strong("诊断信息"),
+            div(style = "margin-top:12px;"),
+            verbatimTextOutput("diag"))))
+    }
+    p <- page(); s <- reactiveValuesToList(rv)
+    switch(as.character(p),
+      "0"  = intro_page(),
+      "1"  = q0_page(s),  "2"  = q1_page(s),  "3"  = q2_page(s),
+      "4"  = q3_page(s),  "5"  = q4_page(s),  "6"  = q5_page(s),
+      "7"  = q6_page(s),  "8"  = q7_page(s),  "9"  = q8_page(s),
+      "10" = q9_page(s),  "11" = q10_page(s), "12" = q11_page(s),
+      "13" = q12_page(s), "14" = thankyou_page())
+  })
+
+  output$dl_csv <- downloadHandler(
+    filename = function() paste0("aqs_responses_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
+    content = function(file) {
+      df_all <- load_all_responses_server()
+      if (is.null(df_all) || nrow(df_all) == 0)
+        df_all <- data.frame(info = "暂无数据", stringsAsFactors = FALSE)
+      tmp <- tempfile(fileext = ".csv")
+      utils::write.csv(df_all, tmp, row.names = FALSE, fileEncoding = "UTF-8")
+      con <- file(file, open = "wb")
+      on.exit(close(con), add = TRUE)
+      writeBin(as.raw(c(0xEF, 0xBB, 0xBF)), con)
+      writeBin(readBin(tmp, "raw", file.info(tmp)$size), con)
+    }
+  )
+
+  output$q6_warn <- renderUI({
+    if (!is.null(input$q6) && length(input$q6) > 3)
+      div(class = "warn-msg", "\u26a0\ufe0f 最多选择 3 项，请重新选择。")
+  })
+  output$q7_warn <- renderUI({
+    if (!is.null(input$q7) && length(input$q7) > 3)
+      div(class = "warn-msg", "\u26a0\ufe0f 最多选择 3 项，请重新选择。")
+  })
+
+  output$nav_ui <- renderUI({
+    if (is_admin()) return(NULL)
+    p <- page(); if (p == THANKYOU_PAGE) return(NULL)
+    div(class = "nav-row",
+        if (p > 0) actionButton("btn_back", "\u2190 上一题", class = "btn-back"),
+        div(class = "nav-spacer"),
+        actionButton("btn_next",
+                     label = if (p == 0) "开始填写 \u2192" else if (p == LAST_Q_PAGE) "提交 \u2713" else "下一题 \u2192",
+                     class = if (p == LAST_Q_PAGE) "btn-submit" else "btn-next"))
+  })
+
+  observeEvent(input$btn_next, {
+    p <- page()
+    if (p == 0) { page(1); scroll_top(); return() }
+    v <- validate_page(p, input)
+    if (!v$ok) { showNotification(v$msg, type = "warning", duration = 4); return() }
+    save_page(p, input, rv)
+
+    if (p == LAST_Q_PAGE) {
+      message("SUBMIT_START wd=", getwd(), " db=", DB_PATH)
+      ok <- tryCatch(write_response(rv), error = function(e) {
+        message("SUBMIT_ERROR: ", e$message); FALSE
+      })
+      message("SUBMIT_RESULT: ", ok)
+      if (!isTRUE(ok)) {
+        showNotification("提交失败，请联系管理员查看 Connect 日志。", type = "error", duration = NULL)
+        return()
+      }
+      # localStorage completed 标记已由客户端 JS 在按钮点击时写入
+      page(THANKYOU_PAGE); scroll_top(); return()
+    }
+
+    next_p <- if (p == 3 && isTRUE(input$q2 == "G")) 6 else p + 1
+    state <- reactiveValuesToList(rv)
+    state <- state[!grepl("^\\.", names(state))]
+    state$current_page <- next_p
+    session$sendCustomMessage("lsSave", state)
+    page(next_p); scroll_top()
+  })
+
+  observeEvent(input$btn_back, {
+    p <- page(); if (p == 0) return()
+    save_page(p, input, rv)
+    prev_p <- if (p == 6 && isTRUE(rv$q2 == "G")) 3 else p - 1
+    if (prev_p >= 0) { page(prev_p); scroll_top() }
+  })
+}
 
 shinyApp(ui = ui, server = server)
