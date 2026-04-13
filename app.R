@@ -493,9 +493,13 @@ Shiny.addCustomMessageHandler("lsClear", function(d){
   try{ localStorage.removeItem("%s"); }catch(e){}
 });
 $(document).ready(function(){
-  // 提交按钮点击时立即写入 completed 标记，session 断开后 reload 仍跳感谢页
-  $(document).on("click", "#btn_next.btn-submit", function(){
-    try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
+  // 提交按钮点击时立即写入 completed 标记（同步、客户端，不走 WebSocket）
+  // 用三种选择器确保至少一种命中，无论 Shiny 如何渲染按钮
+  $(document).on("click", "#btn_next", function(){
+    var el = document.getElementById("btn_next");
+    if (el && (el.classList.contains("btn-submit") || el.innerText.indexOf("\u2713") !== -1)) {
+      try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
+    }
   });
   setTimeout(function(){
     try{
