@@ -10,14 +10,14 @@ ADMIN_KEY     <- "aqs2026admin"
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 
-# ── 存储：每条回答独立 RDS 文件，直接写入 /var/tmp ─────────────────────────────
-# /var/tmp 本身权限是 drwxrwxrwt (1777)，任何用户都可以直接在里面创建文件。
-# 不创建子目录（避免 chmod 失败问题）。
-# 每条提交写一个独立文件（含时间戳+随机数），默认 644，所有用户可读。
-# admin 读取所有 aqs2026_resp_*.rds 文件并合并。
-RESP_PREFIX <- "/var/tmp/aqs2026_resp_"
+# ── 存储：每条回答独立 RDS 文件，写入 /opt/rstudio-connect/mnt/tmp ─────────────
+# /var/tmp 是各服务器本地目录，Connect 多机负载均衡时不共享。
+# /opt/rstudio-connect/mnt/tmp 是 NFS 共享挂载（日志中 tempdir() 就在这里），
+# 所有 Connect 节点共享同一目录，且对所有用户可写（1777）。
+RESP_DIR    <- "/opt/rstudio-connect/mnt/tmp"
+RESP_PREFIX <- file.path(RESP_DIR, "aqs2026_resp_")
 
-message("=== APP START === /var/tmp writable=", file.access("/var/tmp", 2) == 0)
+message("=== APP START === mnt/tmp writable=", file.access(RESP_DIR, 2) == 0)
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
 
@@ -43,7 +43,7 @@ clear_rv <- function(rv) {
 }
 
 load_all_responses <- function() {
-  files <- Sys.glob("/var/tmp/aqs2026_resp_*.rds")
+  files <- Sys.glob(paste0(RESP_PREFIX, "*.rds"))
   if (length(files) == 0) return(NULL)
   rows <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
   rows <- Filter(Negate(is.null), rows)
@@ -97,9 +97,11 @@ write_response <- function(rv, user_id = NA_character_) {
     stringsAsFactors = FALSE
   )
 
+  ts    <- Sys.time()
+  ms    <- as.integer(as.numeric(ts) * 1000) %% 1000
   fname <- paste0(RESP_PREFIX,
-                  format(Sys.time(), "%Y%m%d_%H%M%S_"),
-                  as.integer(Sys.time() * 1000) %% 1000, "_",
+                  format(ts, "%Y%m%d_%H%M%S_"),
+                  sprintf("%03d", ms), "_",
                   sample.int(99999, 1), ".rds")
   tryCatch({
     saveRDS(df, fname)
@@ -633,9 +635,10 @@ server <- function(input, output, session) {
   load_all_responses_server <- function() load_all_responses()
 
   output$diag <- renderPrint({
-    files <- Sys.glob("/var/tmp/aqs2026_resp_*.rds")
+    files <- Sys.glob(paste0(RESP_PREFIX, "*.rds"))
     list(
-      var_tmp_writable = file.access("/var/tmp", 2) == 0,
+      RESP_DIR         = RESP_DIR,
+      mnt_tmp_writable = file.access(RESP_DIR, 2) == 0,
       resp_files_found = length(files),
       resp_files       = basename(files),
       session_user     = tryCatch(session$user, error = function(e) NA_character_)
@@ -657,7 +660,7 @@ server <- function(input, output, session) {
             p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
               style = "font-size:16px;margin-bottom:16px;"),
             p(style = "font-size:12px;color:#64748B;margin-bottom:16px;",
-              paste0("存储：/var/tmp/aqs2026_resp_*.rds")),
+              paste0("存储：", RESP_DIR, "/aqs2026_resp_*.rds")),
             if (n == 0)
               p(style = "color:#64748B;", "尚无回答数据。")
             else
@@ -725,7 +728,7 @@ server <- function(input, output, session) {
 
     if (p == LAST_Q_PAGE) {
       uid <- tryCatch(session$user, error = function(e) NA_character_)
-      message("SUBMIT_START wd=", getwd(), " db=", DB_PATH, " user=", uid)
+      message("SUBMIT_START user=", uid, " resp_dir=", RESP_DIR)
       ok <- tryCatch(write_response(rv, user_id = uid), error = function(e) {
         message("SUBMIT_ERROR: ", e$message); FALSE
       })
