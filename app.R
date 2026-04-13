@@ -12,8 +12,11 @@ ADMIN_KEY     <- "aqs2026admin"
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 
-DATA_DIR <- file.path(path.expand("~"), "aqs_survey_data")
+# /var/tmp 在 RHEL 上是 drwxrwxrwt（所有用户可写），跨进程共享，服务器重启后保留
+# path.expand("~") 在 run-as-viewer 模式下每个用户不同，不能用于共享存储
+DATA_DIR <- "/var/tmp/aqs_survey_2026"
 dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
+Sys.chmod(DATA_DIR, mode = "0777")
 
 DB_PATH <- file.path(DATA_DIR, "responses.sqlite")
 
