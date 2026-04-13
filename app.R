@@ -443,6 +443,11 @@ server <- function(input, output, session) {
   # ── LocalStorage 恢复 ──
   observeEvent(input[["_ls_restore"]], once=TRUE, {
     state  <- input[["_ls_restore"]]
+    # 检测已完成标记：直接跳到感谢页并清除标记
+    if (isTRUE(state[["completed"]])) {
+      runjs(sprintf("try{localStorage.removeItem('%s');}catch(e){}", LS_KEY))
+      page(THANKYOU_PAGE); scroll_top(); return()
+    }
     p_back <- as.integer(state[["current_page"]]%||%0)
     if (is.na(p_back)||p_back<=1||p_back>=THANKYOU_PAGE){
       runjs(sprintf("try{localStorage.removeItem('%s');}catch(e){}", LS_KEY))
@@ -579,9 +584,9 @@ server <- function(input, output, session) {
     if(!v$ok){showNotification(v$msg,type="warning",duration=4);return()}
     save_page(p,input,rv)
     if(p==LAST_Q_PAGE){
-      runjs(sprintf("try{localStorage.removeItem('%s');}catch(e){}", LS_KEY))
       write_response(rv,user_id)
-      # 立即弹出感谢弹窗（不依赖 Shiny 页面重渲染，防止 session 断开前来不及显示）
+      # 先写入"已完成"标记到 localStorage，session 断开后 reload 仍能跳到感谢页
+      runjs(sprintf("try{localStorage.setItem('%s',JSON.stringify({completed:true}));}catch(e){}", LS_KEY))
       showModal(modalDialog(
         title = NULL,
         div(class="ty-wrap", style="padding:24px 8px 8px;",
