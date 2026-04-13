@@ -492,37 +492,18 @@ Shiny.addCustomMessageHandler("lsClear", function(d){
   try{ localStorage.removeItem("%s"); }catch(e){}
 });
 
-var TY_HTML = [
-  "<div id=\\"ty-js-overlay\\" style=\\"position:fixed;top:0;left:0;width:100%%;height:100%%;",
-  "background:#F8FAFC;z-index:99999;display:flex;align-items:center;justify-content:center;\\">",
-  "<div style=\\"max-width:560px;padding:40px 24px;text-align:center;\\">",
-  "<div style=\\"font-size:56px;margin-bottom:16px;\\">&#127881;</div>",
-  "<h2 style=\\"font-size:24px;font-weight:700;color:#1E293B;margin-bottom:8px;\\">",
-  "\u611f\u8c22\u4f60\u7684\u586b\u5199\uff01</h2>",
-  "<p style=\\"color:#64748B;font-size:15px;\\">\u95ee\u5377\u5df2\u6210\u529f\u63d0\u4ea4</p>",
-  "<div style=\\"background:#fff;border-radius:12px;border:1px solid #E2E8F0;padding:20px 24px;",
-  "text-align:left;margin-top:24px;font-size:14px;color:#475569;\\">",
-  "<p>\u56de\u6536\u7684\u7ed3\u679c\u5c06\u5728 4 \u6708\u5e95\u4ee5\u533f\u540d\u6c47\u603b\u7684\u5f62\u5f0f\u4e0e\u5168\u90e8\u95e8\u540c\u6b65\u3002</p>",
-  "</div></div></div>"
-].join("");
-
 $(document).ready(function(){
-  // 提交按钮按下时：1) 写 localStorage 标记  2) 立即用纯 JS 渲染感谢页
-  // 两步都在浏览器本地完成，完全不依赖 WebSocket / Shiny session
-  function handleSubmit() {
+  // 提交按钮按下时：只写 localStorage 标记，不注入任何覆盖层。
+  // 注入覆盖层会遮住按钮，导致 click 事件打在覆盖层上而非按钮上，
+  // Shiny 收不到 btn_next 的点击，write_response() 永远不会执行。
+  $(document).on("mousedown touchstart", "#btn_next", function(){
     var el = document.getElementById("btn_next");
     if (!el) return;
     var isSubmit = el.classList.contains("btn-submit") ||
                    el.textContent.indexOf("\u2713") !== -1;
     if (!isSubmit) return;
-    // 写 completed 标记
     try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
-    // 立即显示感谢覆盖层
-    if (!document.getElementById("ty-js-overlay")) {
-      document.body.insertAdjacentHTML("beforeend", TY_HTML);
-    }
-  }
-  $(document).on("mousedown touchstart", "#btn_next", handleSubmit);
+  });
 
   // 页面加载时检查 localStorage
   setTimeout(function(){
@@ -530,19 +511,11 @@ $(document).ready(function(){
       var s = localStorage.getItem("%s");
       if (!s) return;
       var d = JSON.parse(s);
-      // 已完成：直接显示感谢层并清除标记（不依赖 Shiny session）
-      if (d.completed === true) {
-        try{ localStorage.removeItem("%s"); }catch(e){}
-        if (!document.getElementById("ty-js-overlay")) {
-          document.body.insertAdjacentHTML("beforeend", TY_HTML);
-        }
-        return;
-      }
-      // 未完成：通知 Shiny 恢复进度
+      // 已完成或未完成：统一通知 Shiny，由服务端决定跳转到感谢页还是恢复进度
       Shiny.setInputValue("_ls_restore", d, {priority:"event"});
     }catch(e){}
   }, 600);
-});', LS_KEY, LS_KEY, LS_KEY, LS_KEY, LS_KEY)
+});', LS_KEY, LS_KEY, LS_KEY, LS_KEY)
 
 ui <- fluidPage(
   title = "AQS AI 使用现状摸底问卷",
