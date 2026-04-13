@@ -5,45 +5,19 @@ library(shiny)
 library(bslib)
 library(shinyjs)
 library(sortable)
-library(DBI)
-library(RSQLite)
 
 ADMIN_KEY     <- "aqs2026admin"
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 
-# ── 存储：SQLite 共享文件，固定绝对路径 ────────────────────────────────────────
-# /var/tmp 在 RHEL 是 drwxrwxrwt（所有用户可建文件）
-# journal_mode=DELETE（而非 WAL）：读操作不需要写 .shm 文件，任何用户均可读
-# DB 文件 chmod 666：所有用户可写同一个文件
-DATA_DIR <- "/var/tmp/aqs_survey_2026"
-DB_PATH  <- file.path(DATA_DIR, "responses.sqlite")
+# ── 存储：每条回答独立 RDS 文件，直接写入 /var/tmp ─────────────────────────────
+# /var/tmp 本身权限是 drwxrwxrwt (1777)，任何用户都可以直接在里面创建文件。
+# 不创建子目录（避免 chmod 失败问题）。
+# 每条提交写一个独立文件（含时间戳+随机数），默认 644，所有用户可读。
+# admin 读取所有 aqs2026_resp_*.rds 文件并合并。
+RESP_PREFIX <- "/var/tmp/aqs2026_resp_"
 
-dir.create(DATA_DIR, recursive = TRUE, showWarnings = FALSE)
-Sys.chmod(DATA_DIR, mode = "0777")
-
-# 初始化表结构（app 启动时运行一次）
-tryCatch({
-  con0 <- dbConnect(SQLite(), DB_PATH)
-  dbExecute(con0, "PRAGMA journal_mode=DELETE")  # 不产生 .shm/.wal，多用户读无障碍
-  dbExecute(con0, "CREATE TABLE IF NOT EXISTS responses (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    submitted_at TEXT, user_id TEXT,
-    q0 TEXT, q1 TEXT, q1_other TEXT,
-    q2 TEXT, q2_other TEXT,
-    q3_ranking TEXT, q3_other TEXT,
-    q4 TEXT, q5 TEXT, q5_other_text TEXT, q5_text TEXT,
-    q6 TEXT, q6_other TEXT, q7 TEXT, q7_other TEXT,
-    q8 TEXT, q9_ranking TEXT, q9_other TEXT,
-    q10 TEXT, q10_other TEXT, q11 TEXT, q12 TEXT
-  )")
-  dbDisconnect(con0)
-  Sys.chmod(DB_PATH, mode = "0666")  # 所有用户可读写此文件
-  message("✓ DB ready: ", DB_PATH)
-}, error = function(e) message("⚠ DB init failed: ", e$message))
-
-message("=== APP START === DATA_DIR writable=", file.access(DATA_DIR, 2) == 0,
-        "  DB exists=", file.exists(DB_PATH))
+message("=== APP START === /var/tmp writable=", file.access("/var/tmp", 2) == 0)
 
 `%||%` <- function(a, b) if (!is.null(a) && length(a) > 0) a else b
 
@@ -69,14 +43,12 @@ clear_rv <- function(rv) {
 }
 
 load_all_responses <- function() {
-  if (!file.exists(DB_PATH)) return(NULL)
-  tryCatch({
-    con <- dbConnect(SQLite(), DB_PATH)
-    on.exit(dbDisconnect(con), add = TRUE)
-    dbExecute(con, "PRAGMA journal_mode=DELETE")
-    df <- dbReadTable(con, "responses")
-    if (nrow(df) == 0) NULL else df
-  }, error = function(e) { message("load_all_responses failed: ", e$message); NULL })
+  files <- Sys.glob("/var/tmp/aqs2026_resp_*.rds")
+  if (length(files) == 0) return(NULL)
+  rows <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
+  rows <- Filter(Negate(is.null), rows)
+  if (length(rows) == 0) return(NULL)
+  do.call(rbind, rows)
 }
 
 write_response <- function(rv, user_id = NA_character_) {
@@ -125,15 +97,16 @@ write_response <- function(rv, user_id = NA_character_) {
     stringsAsFactors = FALSE
   )
 
+  fname <- paste0(RESP_PREFIX,
+                  format(Sys.time(), "%Y%m%d_%H%M%S_"),
+                  as.integer(Sys.time() * 1000) %% 1000, "_",
+                  sample.int(99999, 1), ".rds")
   tryCatch({
-    con <- dbConnect(SQLite(), DB_PATH)
-    on.exit(dbDisconnect(con), add = TRUE)
-    dbExecute(con, "PRAGMA journal_mode=DELETE")
-    dbWriteTable(con, "responses", df, append = TRUE, row.names = FALSE)
-    message("✓ SQLite write success: ", DB_PATH)
+    saveRDS(df, fname)
+    message("✓ saved: ", fname)
     TRUE
   }, error = function(e) {
-    message("✗ SQLite write failed: ", e$message)
+    message("✗ save failed: ", e$message)
     FALSE
   })
 }
@@ -626,15 +599,12 @@ server <- function(input, output, session) {
   load_all_responses_server <- function() load_all_responses()
 
   output$diag <- renderPrint({
-    df_now <- tryCatch(load_all_responses_server(), error = function(e) NULL)
+    files <- Sys.glob("/var/tmp/aqs2026_resp_*.rds")
     list(
-      DATA_DIR          = DATA_DIR,
-      DATA_DIR_writable = file.access(DATA_DIR, 2) == 0,
-      DB_PATH           = DB_PATH,
-      DB_exists         = file.exists(DB_PATH),
-      DB_size_bytes     = if (file.exists(DB_PATH)) file.info(DB_PATH)$size else NA,
-      response_count    = if (is.null(df_now)) 0L else nrow(df_now),
-      session_user      = tryCatch(session$user, error = function(e) NA)
+      var_tmp_writable = file.access("/var/tmp", 2) == 0,
+      resp_files_found = length(files),
+      resp_files       = basename(files),
+      session_user     = tryCatch(session$user, error = function(e) NA_character_)
     )
   })
   output$admin_preview <- renderTable({
@@ -653,7 +623,7 @@ server <- function(input, output, session) {
             p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
               style = "font-size:16px;margin-bottom:16px;"),
             p(style = "font-size:12px;color:#64748B;margin-bottom:16px;",
-              paste0("DB：", DB_PATH)),
+              paste0("存储：/var/tmp/aqs2026_resp_*.rds")),
             if (n == 0)
               p(style = "color:#64748B;", "尚无回答数据。")
             else
