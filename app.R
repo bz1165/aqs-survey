@@ -10,10 +10,7 @@ ADMIN_KEY     <- "aqs2026admin"
 LAST_Q_PAGE   <- 13
 THANKYOU_PAGE <- 14
 
-# ── 存储：每条回答独立 RDS 文件，写入 /opt/rstudio-connect/mnt/tmp ─────────────
-# /var/tmp 是各服务器本地目录，Connect 多机负载均衡时不共享。
-# /opt/rstudio-connect/mnt/tmp 是 NFS 共享挂载（日志中 tempdir() 就在这里），
-# 所有 Connect 节点共享同一目录，且对所有用户可写（1777）。
+# ── 存储：每条回答独立 RDS 文件，写入共享目录 /opt/rstudio-connect/mnt/tmp ──
 RESP_DIR    <- "/opt/rstudio-connect/mnt/tmp"
 RESP_PREFIX <- file.path(RESP_DIR, "aqs2026_resp_")
 
@@ -37,7 +34,7 @@ clear_rv <- function(rv) {
   nm <- c(
     "q0","q1","q1_other","q2","q2_other","q3","q3_other","q4",
     "q5","q5_other_text","q5_text","q6","q6_other","q7","q7_other",
-    "q8","q9","q9_other","q10","q10_other","q11","q12"
+    "q8","q9","q9_other","q10","q10_other","q11","q12",".resume_page"
   )
   for (x in nm) rv[[x]] <- NULL
 }
@@ -45,10 +42,23 @@ clear_rv <- function(rv) {
 load_all_responses <- function() {
   files <- Sys.glob(paste0(RESP_PREFIX, "*.rds"))
   if (length(files) == 0) return(NULL)
-  rows <- lapply(files, function(f) tryCatch(readRDS(f), error = function(e) NULL))
+
+  rows <- lapply(files, function(f) {
+    tryCatch(
+      readRDS(f),
+      error = function(e) {
+        message("READ_FAIL: ", f, " :: ", e$message)
+        NULL
+      }
+    )
+  })
+
   rows <- Filter(Negate(is.null), rows)
   if (length(rows) == 0) return(NULL)
-  do.call(rbind, rows)
+
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
 }
 
 write_response <- function(rv, user_id = NA_character_) {
@@ -97,15 +107,21 @@ write_response <- function(rv, user_id = NA_character_) {
     stringsAsFactors = FALSE
   )
 
-  ts    <- Sys.time()
-  ms    <- as.integer(as.numeric(ts) * 1000) %% 1000
-  fname <- paste0(RESP_PREFIX,
-                  format(ts, "%Y%m%d_%H%M%S_"),
-                  sprintf("%03d", ms), "_",
-                  sample.int(99999, 1), ".rds")
+  ts <- Sys.time()
+  fname <- paste0(
+    RESP_PREFIX,
+    format(ts, "%Y%m%d_%H%M%S"),
+    "_",
+    sprintf("%05d", sample.int(99999, 1)),
+    ".rds"
+  )
+
   tryCatch({
     saveRDS(df, fname)
+    Sys.chmod(fname, mode = "0644")
     message("✓ saved: ", fname)
+    message("✓ file exists after save: ", file.exists(fname))
+    message("✓ file mode: ", as.character(as.octmode(file.info(fname)$mode)))
     TRUE
   }, error = function(e) {
     message("✗ save failed: ", e$message)
@@ -467,7 +483,6 @@ save_page <- function(p, input, rv) {
   if (p== 1){rv$q0 <- input$q0}
   if (p== 2){rv$q1 <- input$q1;          rv$q1_other      <- input$q1_other}
   if (p== 3){rv$q2 <- input$q2;          rv$q2_other      <- input$q2_other}
-  # rank_list 未拖拽时 input 为 NULL，回退到默认顺序
   if (p== 4){rv$q3 <- if(length(input$q3_ranking)>0) input$q3_ranking else Q3_ITEMS
              rv$q3_other <- input$q3_ranking_other}
   if (p== 5){rv$q4 <- input$q4}
@@ -493,9 +508,6 @@ Shiny.addCustomMessageHandler("lsClear", function(d){
 });
 
 $(document).ready(function(){
-  // 提交按钮按下时：只写 localStorage 标记，不注入任何覆盖层。
-  // 注入覆盖层会遮住按钮，导致 click 事件打在覆盖层上而非按钮上，
-  // Shiny 收不到 btn_next 的点击，write_response() 永远不会执行。
   $(document).on("mousedown touchstart", "#btn_next", function(){
     var el = document.getElementById("btn_next");
     if (!el) return;
@@ -505,13 +517,11 @@ $(document).ready(function(){
     try{ localStorage.setItem("%s", JSON.stringify({completed:true})); }catch(e){}
   });
 
-  // 页面加载时检查 localStorage
   setTimeout(function(){
     try{
       var s = localStorage.getItem("%s");
       if (!s) return;
       var d = JSON.parse(s);
-      // 已完成或未完成：统一通知 Shiny，由服务端决定跳转到感谢页还是恢复进度
       Shiny.setInputValue("_ls_restore", d, {priority:"event"});
     }catch(e){}
   }, 600);
@@ -551,10 +561,8 @@ server <- function(input, output, session) {
     isTRUE(!is.null(q$admin) && q$admin == ADMIN_KEY)
   })
 
-  # ── LocalStorage 恢复 ──────────────────────────────
   observeEvent(input[["_ls_restore"]], once = TRUE, {
     state <- input[["_ls_restore"]]
-    # 检测已完成标记：直接跳到感谢页并清除
     if (isTRUE(state[["completed"]])) {
       session$sendCustomMessage("lsClear", list())
       page(THANKYOU_PAGE); scroll_top(); return()
@@ -582,7 +590,7 @@ server <- function(input, output, session) {
     removeModal(); page(as.integer(rv$.resume_page %||% 1)); scroll_top()
   })
   observeEvent(input$btn_restart_modal, {
-    removeModal(); session$sendCustomMessage("lsClear", list()); page(1); scroll_top()
+    removeModal(); clear_rv(rv); session$sendCustomMessage("lsClear", list()); page(1); scroll_top()
   })
 
   output$top_bar_right <- renderUI({
@@ -605,8 +613,6 @@ server <- function(input, output, session) {
     div(class = "section-badge", lbl)
   })
 
-  load_all_responses_server <- function() load_all_responses()
-
   output$diag <- renderPrint({
     files <- Sys.glob(paste0(RESP_PREFIX, "*.rds"))
     list(
@@ -617,18 +623,19 @@ server <- function(input, output, session) {
       session_user     = tryCatch(session$user, error = function(e) NA_character_)
     )
   })
+
   output$admin_preview <- renderTable({
-    df <- load_all_responses_server()
+    df <- load_all_responses()
     if (is.null(df) || nrow(df) == 0) return(NULL)
-    utils::head(df[rev(seq_len(nrow(df))), , drop = FALSE], 5)
+    utils::head(df[rev(seq_len(nrow(df))), , drop = FALSE], 10)
   }, striped = TRUE, bordered = TRUE, spacing = "s", width = "100%")
 
   output$question_ui <- renderUI({
     if (is_admin()) {
-      df_now <- load_all_responses_server()
+      df_now <- load_all_responses()
       n <- if (is.null(df_now)) 0L else nrow(df_now)
       return(div(style = "padding:40px 8px;",
-        h2(style = "margin-bottom:16px;", "\U0001f4e5 AQS 问卷管理员面板"),
+        h2(style = "margin-bottom:16px;", "📥 AQS 问卷管理员面板"),
         div(class = "info-card",
             p(tags$strong(paste0("当前共收到 ", n, " 份回答")),
               style = "font-size:16px;margin-bottom:16px;"),
@@ -638,7 +645,7 @@ server <- function(input, output, session) {
               p(style = "color:#64748B;", "尚无回答数据。")
             else
               tagList(
-                downloadButton("dl_csv", "\u2B07\uFE0F 下载全部回答（CSV）",
+                downloadButton("dl_csv", "⬇️ 下载全部回答（CSV）",
                                style = "background:#3B82F6;color:#fff;border:none;padding:10px 24px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;"),
                 div(style = "margin-top:20px;"),
                 tableOutput("admin_preview")),
@@ -647,6 +654,7 @@ server <- function(input, output, session) {
             div(style = "margin-top:12px;"),
             verbatimTextOutput("diag"))))
     }
+
     p <- page(); s <- reactiveValuesToList(rv)
     switch(as.character(p),
       "0"  = intro_page(),
@@ -660,7 +668,7 @@ server <- function(input, output, session) {
   output$dl_csv <- downloadHandler(
     filename = function() paste0("aqs_responses_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"),
     content = function(file) {
-      df_all <- load_all_responses_server()
+      df_all <- load_all_responses()
       if (is.null(df_all) || nrow(df_all) == 0)
         df_all <- data.frame(info = "暂无数据", stringsAsFactors = FALSE)
       tmp <- tempfile(fileext = ".csv")
@@ -674,21 +682,21 @@ server <- function(input, output, session) {
 
   output$q6_warn <- renderUI({
     if (!is.null(input$q6) && length(input$q6) > 3)
-      div(class = "warn-msg", "\u26a0\ufe0f 最多选择 3 项，请重新选择。")
+      div(class = "warn-msg", "⚠️ 最多选择 3 项，请重新选择。")
   })
   output$q7_warn <- renderUI({
     if (!is.null(input$q7) && length(input$q7) > 3)
-      div(class = "warn-msg", "\u26a0\ufe0f 最多选择 3 项，请重新选择。")
+      div(class = "warn-msg", "⚠️ 最多选择 3 项，请重新选择。")
   })
 
   output$nav_ui <- renderUI({
     if (is_admin()) return(NULL)
     p <- page(); if (p == THANKYOU_PAGE) return(NULL)
     div(class = "nav-row",
-        if (p > 0) actionButton("btn_back", "\u2190 上一题", class = "btn-back"),
+        if (p > 0) actionButton("btn_back", "← 上一题", class = "btn-back"),
         div(class = "nav-spacer"),
         actionButton("btn_next",
-                     label = if (p == 0) "开始填写 \u2192" else if (p == LAST_Q_PAGE) "提交 \u2713" else "下一题 \u2192",
+                     label = if (p == 0) "开始填写 →" else if (p == LAST_Q_PAGE) "提交 ✓" else "下一题 →",
                      class = if (p == LAST_Q_PAGE) "btn-submit" else "btn-next"))
   })
 
@@ -710,7 +718,6 @@ server <- function(input, output, session) {
         showNotification("提交失败，请联系管理员查看 Connect 日志。", type = "error", duration = NULL)
         return()
       }
-      # localStorage completed 标记已由客户端 JS 在按钮点击时写入
       page(THANKYOU_PAGE); scroll_top(); return()
     }
 
